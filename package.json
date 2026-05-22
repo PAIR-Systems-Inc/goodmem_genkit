@@ -15,7 +15,7 @@
     "genai",
     "generative-ai"
   ],
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "commonjs",
   "scripts": {
     "check": "tsc",
@@ -29,7 +29,7 @@
   "homepage": "https://github.com/PAIR-Systems-Inc/goodmem_genkit",
   "repository": {
     "type": "git",
-    "url": "https://github.com/PAIR-Systems-Inc/goodmem_genkit.git"
+    "url": "git+https://github.com/PAIR-Systems-Inc/goodmem_genkit.git"
   },
   "bugs": {
     "url": "https://github.com/PAIR-Systems-Inc/goodmem_genkit/issues"

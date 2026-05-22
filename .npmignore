@@ -1,0 +1,11 @@
+node_modules
+src
+tests
+examples
+tsconfig.json
+tsup.config.ts
+typedoc.json
+.github
+.gitignore
+.npmignore
+*.tgz

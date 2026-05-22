@@ -1,0 +1,71 @@
+{
+  "name": "genkitx-goodmem",
+  "description": "Genkit AI framework plugin for GoodMem, a retrieval-augmented generation (RAG) memory service.",
+  "keywords": [
+    "genkit",
+    "genkit-plugin",
+    "goodmem",
+    "memory",
+    "vector",
+    "embedding",
+    "semantic-retrieval",
+    "rag",
+    "retrieval-augmented-generation",
+    "ai",
+    "genai",
+    "generative-ai"
+  ],
+  "version": "0.1.0",
+  "type": "commonjs",
+  "scripts": {
+    "check": "tsc",
+    "compile": "tsup-node",
+    "build:clean": "rimraf ./lib",
+    "build": "npm-run-all build:clean check compile",
+    "build:watch": "tsup-node --watch",
+    "test": "tsx --test tests/goodmem_test.ts",
+    "demo": "tsx examples/example_usage.ts"
+  },
+  "homepage": "https://github.com/PAIR-Systems-Inc/goodmem_genkit",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PAIR-Systems-Inc/goodmem_genkit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PAIR-Systems-Inc/goodmem_genkit/issues"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "genkit": "^1.0.0"
+  },
+  "devDependencies": {
+    "@genkit-ai/compat-oai": "^1.35.0",
+    "@types/node": "^20.11.16",
+    "genkit": "^1.35.0",
+    "npm-run-all": "^4.1.5",
+    "rimraf": "^6.0.1",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  },
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "require": "./lib/index.js",
+      "import": "./lib/index.mjs",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "publishConfig": {
+    "provenance": true,
+    "access": "public"
+  }
+}

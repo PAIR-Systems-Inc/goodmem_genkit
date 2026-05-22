@@ -1,0 +1,89 @@
+name: Publish to npm
+
+# Builds and tests the package on every push and PR. Publishes to npm when a
+# `v*` git tag is pushed. Authentication uses npm Trusted Publishers (OpenID
+# Connect). No NPM_TOKEN is stored as a GitHub secret.
+#
+# One-time setup on npm:
+#   1. Create the package on https://www.npmjs.com (or claim the name).
+#   2. Open the package settings -> Trusted publishers -> "Add a publisher".
+#      Provider:    GitHub Actions
+#      Repository:  PAIR-Systems-Inc/goodmem_genkit
+#      Workflow:    publish.yml
+#      Environment: npm
+#
+# Release procedure:
+#   1. Bump `version` in package.json.
+#   2. Commit and tag, e.g. `git tag v0.1.0 && git push --tags`.
+#   3. This workflow runs the `publish` job against the GitHub environment
+#      `npm` and uploads the freshly-built tarball.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Pack tarball
+        run: npm pack
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-tarball
+          path: "*.tgz"
+
+  publish:
+    name: Publish to npm
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/genkitx-goodmem
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Publish via Trusted Publishing
+        run: npm publish --provenance --access public

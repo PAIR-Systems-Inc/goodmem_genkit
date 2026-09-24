@@ -1,1054 +1,356 @@
-import * as assert from 'assert';
-import { genkit } from 'genkit';
-import { afterEach, beforeEach, describe, it, mock } from 'node:test';
-import { goodmem, listEmbedders, listSpaces } from '../src/index.js';
-
-// ---------------------------------------------------------------------------
-// Mock helpers
-// ---------------------------------------------------------------------------
-
-function mockResponse(body: any, status = 200, ok = true): Response {
-  return {
-    ok,
-    status,
-    statusText: ok ? 'OK' : 'Error',
-    json: async () => body,
-    text: async () => JSON.stringify(body),
-    headers: new Headers(),
-    redirected: false,
-    type: 'basic' as ResponseType,
-    url: '',
-    clone: () => mockResponse(body, status, ok),
-    body: null,
-    bodyUsed: false,
-    arrayBuffer: async () => new ArrayBuffer(0),
-    blob: async () => new Blob(),
-    formData: async () => new FormData(),
-    bytes: async () => new Uint8Array(),
-  } as Response;
-}
-
-function mockNdjsonResponse(lines: any[], status = 200): Response {
-  const ndjson = lines.map((l) => JSON.stringify(l)).join('\n');
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    statusText: 'OK',
-    json: async () => JSON.parse(ndjson),
-    text: async () => ndjson,
-    headers: new Headers(),
-    redirected: false,
-    type: 'basic' as ResponseType,
-    url: '',
-    clone: () => mockNdjsonResponse(lines, status),
-    body: null,
-    bodyUsed: false,
-    arrayBuffer: async () => new ArrayBuffer(0),
-    blob: async () => new Blob(),
-    formData: async () => new FormData(),
-    bytes: async () => new Uint8Array(),
-  } as Response;
-}
-
-function mockErrorResponse(
-  status: number,
-  body: any = { message: 'Not Found' }
-): Response {
-  return mockResponse(body, status, false);
-}
-
 /**
- * Helper to call a registered Genkit tool by action key.
+ * Offline tests for genkitx-goodmem.
+ *
+ * These drive the *real* GoodMem SDK over a mocked `fetch`, fed with NDJSON
+ * and JSON captured from a live GoodMem server (v1.0.320). 0.1.2's suite
+ * hand-built Response objects whose `.json()` always worked, which is exactly
+ * why its 34 passing tests were green against a content path that failed on
+ * every memory.
  */
-async function callTool(ai: any, toolName: string, input: any): Promise<any> {
-  const action = await ai.registry.lookupAction(`/tool/${toolName}`);
-  if (!action) {
-    throw new Error(`Tool not found: ${toolName}`);
-  }
-  return action(input);
+
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, it } from 'node:test';
+
+import { genkit } from 'genkit';
+
+import * as filters from '../src/filters.js';
+import { GoodMemFilterError } from '../src/filters.js';
+import {
+  MALFORMED_STREAM_CODE,
+  UNKNOWN_CODE,
+  classifyStatus,
+  orientScore,
+} from '../src/results.js';
+import { GoodMemUploadError, resolveUploadPath } from '../src/uploads.js';
+import { decodeContent, goodmem } from '../src/index.js';
+
+const FIXTURES = join(import.meta.dirname ?? __dirname, 'goodmem_fixtures');
+const fixture = (name: string) => readFileSync(join(FIXTURES, name));
+
+const BASE = 'https://goodmem.test';
+const KEY = 'gm_offline_test_key';
+
+let originalFetch: typeof globalThis.fetch;
+beforeEach(() => {
+  originalFetch = globalThis.fetch;
+});
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+});
+
+/** Serve captured server bytes for the retrieve endpoint. */
+function serveRetrieve(payload: Buffer, capture?: { body?: any }) {
+  globalThis.fetch = (async (url: any, init: any) => {
+    const href = String(url);
+    if (href.includes(':retrieve')) {
+      if (capture && init?.body) capture.body = JSON.parse(String(init.body));
+      return new Response(payload, {
+        status: 200,
+        headers: { 'content-type': 'application/x-ndjson' },
+      });
+    }
+    return new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } });
+  }) as any;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+function makeAi(overrides: Record<string, unknown> = {}) {
+  return genkit({
+    plugins: [
+      goodmem({ baseUrl: BASE, apiKey: KEY, spaceIds: ['space-1'], ...overrides } as any),
+    ],
+  });
+}
 
-describe('GoodMem Plugin', () => {
-  let originalFetch: typeof globalThis.fetch;
+async function callTool(ai: any, name: string, input: any) {
+  const action = await ai.registry.lookupAction(`/tool/goodmem/${name}`);
+  const result = await action(input);
+  return result.result ?? result;
+}
 
+describe('fixtures', () => {
+  it('are real server bytes', () => {
+    const stream = fixture('retrieve_ok.ndjson').toString();
+    const events = stream.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    assert.ok(events.some((e) => e.resultSetBoundary));
+    assert.ok(events.some((e) => e.retrievedItem));
+    assert.match(stream, /[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-/i);
+  });
+
+  it('carry no credential', () => {
+    for (const name of ['retrieve_ok.ndjson', 'spaces_page1.json', 'memory_get.json']) {
+      assert.doesNotMatch(fixture(name).toString(), /gm_[a-z0-9]{20,}/);
+    }
+  });
+});
+
+describe('retrieval status contract', () => {
+  it('Q4a: a degraded retrieval still returns its hits', async () => {
+    serveRetrieve(fixture('retrieve_degraded_hits.ndjson'));
+    const out = await callTool(makeAi(), 'search', { query: 'canary', topK: 5 });
+    assert.ok(out.totalResults > 0, 'hits were discarded');
+    assert.equal(out.partial, true);
+    const codes = out.statuses.map((s: any) => s.code);
+    assert.ok(codes.includes('NOT_FOUND') || codes.includes('RERANKING_FAILED'));
+    assert.ok(out.warning);
+  });
+
+  it('Q4b: a degraded retrieval with no hits is flagged, not empty-looking', async () => {
+    serveRetrieve(fixture('retrieve_degraded_empty.ndjson'));
+    const out = await callTool(makeAi(), 'search', { query: 'nothing', topK: 5 });
+    assert.equal(out.totalResults, 0);
+    assert.equal(out.partial, true);
+    assert.ok(out.statuses.length > 0);
+  });
+
+  it('Q1: the two informational codes are noise, by code alone', () => {
+    assert.equal(classifyStatus('FEATURE_DISABLED', 'x').informational, true);
+    assert.equal(classifyStatus('LLM_CAPABILITY_INFERRED', 'x').informational, true);
+    assert.equal(classifyStatus('EMBEDDER_FAILED', 'x').informational, false);
+  });
+
+  it('Q3: an unrecognised code becomes UNKNOWN and keeps the original', () => {
+    const { status, informational } = classifyStatus('SOME_FUTURE_CODE', 'new');
+    assert.equal(status.code, UNKNOWN_CODE);
+    assert.equal(status.message, 'new');
+    assert.equal(status.details?.serverCode, 'SOME_FUTURE_CODE');
+    assert.equal(informational, false);
+  });
+
+  it('a clean stream is not partial', async () => {
+    serveRetrieve(fixture('retrieve_ok.ndjson'));
+    const out = await callTool(makeAi(), 'search', { query: 'canary', topK: 5 });
+    assert.equal(out.partial, false);
+    assert.deepEqual(out.statuses, []);
+    assert.ok(out.totalResults >= 1);
+  });
+
+  it('a truncated stream keeps what arrived and says so', async () => {
+    const whole = fixture('retrieve_ok.ndjson');
+    serveRetrieve(whole.subarray(0, Math.floor(whole.length * 0.6)));
+    const out = await callTool(makeAi(), 'search', { query: 'canary', topK: 5 });
+    assert.equal(out.partial, true);
+    assert.ok(out.statuses.some((s: any) => s.code === MALFORMED_STREAM_CODE));
+  });
+});
+
+describe('scores', () => {
+  it('flips vector scores to higher-is-better', () => {
+    assert.equal(orientScore(-0.51, false), 0.51);
+  });
+
+  it('never flips a reranker score', () => {
+    assert.equal(orientScore(0.93, true), 0.93);
+    assert.equal(orientScore(-0.14, true), -0.14);
+  });
+
+  it('keeps the raw value beside the oriented one', async () => {
+    serveRetrieve(fixture('retrieve_ok.ndjson'));
+    const out = await callTool(makeAi(), 'search', { query: 'canary', topK: 1 });
+    const hit = out.results[0];
+    assert.ok(hit.rawScore < 0);
+    assert.equal(hit.score, -hit.rawScore);
+    assert.equal(hit.scoreKind, 'vector');
+  });
+
+  it('sends no relevance threshold by default', async () => {
+    const capture: { body?: any } = {};
+    serveRetrieve(fixture('retrieve_ok.ndjson'), capture);
+    await callTool(makeAi(), 'search', { query: 'canary', topK: 1 });
+    assert.doesNotMatch(JSON.stringify(capture.body), /relevanceThreshold/);
+  });
+});
+
+describe('native retriever and indexer', () => {
+  it('registers a retriever Genkit RAG can use', async () => {
+    serveRetrieve(fixture('retrieve_ok.ndjson'));
+    const ai = makeAi();
+    const docs = await ai.retrieve({ retriever: 'goodmem/memories', query: 'canary', options: { k: 2 } });
+    assert.ok(docs.length >= 1);
+    const md = docs[0].metadata ?? {};
+    for (const key of ['goodmem_chunk_id', 'goodmem_memory_id', 'goodmem_score', 'goodmem_score_kind']) {
+      assert.ok(key in md, `${key} missing from document metadata`);
+    }
+  });
+
+  it('flags degraded documents', async () => {
+    serveRetrieve(fixture('retrieve_degraded_hits.ndjson'));
+    const ai = makeAi();
+    const docs = await ai.retrieve({ retriever: 'goodmem/memories', query: 'canary' });
+    assert.equal(docs[0].metadata?.goodmem_partial, true);
+    assert.ok(docs[0].metadata?.goodmem_statuses);
+  });
+
+  it('registers an indexer', async () => {
+    const ai = makeAi();
+    const action = await ai.registry.lookupAction('/indexer/goodmem/memories');
+    assert.ok(action, 'no indexer registered');
+  });
+});
+
+describe('tool surface', () => {
+  it('exposes only a search and a write by default', async () => {
+    const ai = makeAi();
+    const actions = await ai.registry.listActions();
+    const names = [
+      ...new Set(
+        Object.keys(actions)
+          .filter((k) => k.startsWith('/tool/goodmem/'))
+          .map((k) => k.slice('/tool/goodmem/'.length))
+      ),
+    ];
+    assert.deepEqual(names.sort(), ['remember', 'search']);
+  });
+
+  it('keeps space management and deletion opt-in', async () => {
+    const ai = makeAi();
+    const actions = await ai.registry.listActions();
+    const names = Object.keys(actions).join(' ');
+    for (const banned of ['delete_space', 'delete_memory', 'update_space', 'create_space']) {
+      assert.ok(!names.includes(banned), `${banned} is exposed by default`);
+    }
+  });
+
+  it('adds management under allowAdminTools, without deletion', async () => {
+    const ai = makeAi({ allowAdminTools: true });
+    const names = Object.keys(await ai.registry.listActions()).join(' ');
+    assert.ok(names.includes('create_space'));
+    assert.ok(!names.includes('delete_space'));
+  });
+
+  it('adds deletion only under allowDelete', async () => {
+    const ai = makeAi({ allowDelete: true });
+    const names = Object.keys(await ai.registry.listActions()).join(' ');
+    assert.ok(names.includes('delete_space') && names.includes('delete_memory'));
+  });
+
+  it('registers no upload tool without an uploadDir', async () => {
+    const ai = makeAi();
+    const names = Object.keys(await ai.registry.listActions()).join(' ');
+    assert.ok(!names.includes('upload_file'));
+  });
+
+  it('the model never chooses a space', async () => {
+    serveRetrieve(fixture('retrieve_ok.ndjson'));
+    const ai = makeAi();
+    const action: any = await ai.registry.lookupAction('/tool/goodmem/search');
+    const keys = Object.keys(action.__action.inputSchema?.shape ?? {});
+    assert.deepEqual(keys.sort(), ['query', 'topK']);
+  });
+
+  it('refuses to start without spaceIds', () => {
+    assert.throws(
+      () => goodmem({ baseUrl: BASE, apiKey: KEY, spaceIds: [] } as any),
+      /spaceIds/
+    );
+  });
+});
+
+describe('publicRead is gone', () => {
+  it('is absent from the plugin source', () => {
+    const src = readFileSync(join(import.meta.dirname ?? __dirname, '..', 'src', 'index.ts'), 'utf8');
+    const code = src
+      .split('\n')
+      .filter((l) => !l.trim().startsWith('*') && !l.trim().startsWith('//'))
+      .join('\n');
+    assert.doesNotMatch(code, /publicRead/);
+  });
+
+  it('update_space accepts only name and labels', async () => {
+    const ai = makeAi({ allowAdminTools: true });
+    const action: any = await ai.registry.lookupAction('/tool/goodmem/update_space');
+    const keys = Object.keys(action.__action.inputSchema?.shape ?? {});
+    assert.ok(!keys.includes('publicRead'));
+    assert.deepEqual(keys.sort(), ['labels', 'name', 'replaceLabels', 'spaceId']);
+  });
+});
+
+describe('content decoding', () => {
+  it('returns text as text', () => {
+    const { content, encoding } = decodeContent(new TextEncoder().encode('hello'), 'text/plain');
+    assert.equal(content, 'hello');
+    assert.equal(encoding, 'text');
+  });
+
+  it('returns binary as base64, never mangled', () => {
+    const pdf = Uint8Array.from([0x25, 0x50, 0x44, 0x46, 0x00, 0xff]);
+    const { content, encoding } = decodeContent(pdf, 'application/pdf');
+    assert.equal(encoding, 'base64');
+    assert.deepEqual(Uint8Array.from(Buffer.from(content, 'base64')), pdf);
+  });
+
+  it('falls back to base64 when text does not decode', () => {
+    const bad = Uint8Array.from([0xff, 0xfe, 0xfd]);
+    assert.equal(decodeContent(bad, 'text/plain').encoding, 'base64');
+  });
+});
+
+describe('uploads', () => {
+  let dir: string;
   beforeEach(() => {
-    originalFetch = globalThis.fetch;
+    dir = mkdtempSync(join(tmpdir(), 'gk-upload-'));
+    writeFileSync(join(dir, 'ok.txt'), 'allowed');
   });
 
-  afterEach(() => {
-    globalThis.fetch = originalFetch;
-    mock.restoreAll();
+  it('refuses an absolute host path', () => {
+    assert.throws(() => resolveUploadPath('/etc/hostname', dir), GoodMemUploadError);
   });
 
-  // ---- Plugin initialization ----
-
-  describe('plugin initialization', () => {
-    it('should throw error when baseUrl is missing', () => {
-      assert.throws(
-        () => goodmem({ baseUrl: '', apiKey: 'test-key' }),
-        /GoodMem plugin requires a baseUrl/
-      );
-    });
-
-    it('should throw error when apiKey is missing', () => {
-      assert.throws(
-        () => goodmem({ baseUrl: 'http://localhost:8080', apiKey: '' }),
-        /GoodMem plugin requires an apiKey/
-      );
-    });
-
-    it('should register all tools when initialized', async () => {
-      globalThis.fetch = async () => mockResponse({});
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-
-      // Wait for plugin initialization
-      await new Promise((r) => setTimeout(r, 200));
-
-      const toolNames = [
-        'goodmem/list_embedders',
-        'goodmem/list_spaces',
-        'goodmem/get_space',
-        'goodmem/create_space',
-        'goodmem/update_space',
-        'goodmem/delete_space',
-        'goodmem/create_memory',
-        'goodmem/list_memories',
-        'goodmem/retrieve_memories',
-        'goodmem/get_memory',
-        'goodmem/delete_memory',
-      ];
-
-      for (const name of toolNames) {
-        const action = await ai.registry.lookupAction(`/tool/${name}`);
-        assert.ok(action, `Tool ${name} should be registered`);
-      }
-    });
+  it('refuses a .. escape', () => {
+    assert.throws(() => resolveUploadPath('../../etc/hostname', dir), GoodMemUploadError);
   });
 
-  // ---- Helper functions ----
-
-  describe('listSpaces', () => {
-    it('should return spaces array from response', async () => {
-      const mockSpaces = [
-        { spaceId: 'sp-1', name: 'test-space' },
-        { spaceId: 'sp-2', name: 'another-space' },
-      ];
-      globalThis.fetch = async () => mockResponse({ spaces: mockSpaces });
-
-      const result = await listSpaces({
-        baseUrl: 'http://localhost:8080',
-        apiKey: 'test-key',
-      });
-
-      assert.ok(Array.isArray(result));
-      assert.strictEqual(result.length, 2);
-      assert.strictEqual(result[0].spaceId, 'sp-1');
-    });
-
-    it('should handle array response directly', async () => {
-      const mockSpaces = [{ spaceId: 'sp-1', name: 'test-space' }];
-      globalThis.fetch = async () => mockResponse(mockSpaces);
-
-      const result = await listSpaces({
-        baseUrl: 'http://localhost:8080',
-        apiKey: 'test-key',
-      });
-
-      assert.ok(Array.isArray(result));
-      assert.strictEqual(result.length, 1);
-    });
-
-    it('should throw on API error', async () => {
-      globalThis.fetch = async () =>
-        mockErrorResponse(500, { message: 'Internal Server Error' });
-
-      await assert.rejects(
-        () =>
-          listSpaces({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        /GoodMem API error \(500\)/
-      );
-    });
+  it('refuses a symlink pointing outside', () => {
+    symlinkSync('/etc/hostname', join(dir, 'escape.txt'));
+    assert.throws(() => resolveUploadPath('escape.txt', dir), GoodMemUploadError);
   });
 
-  describe('listEmbedders', () => {
-    it('should return embedders array from response', async () => {
-      const mockEmbedders = [{ embedderId: 'emb-1', name: 'text-embedding' }];
-      globalThis.fetch = async () => mockResponse({ embedders: mockEmbedders });
-
-      const result = await listEmbedders({
-        baseUrl: 'http://localhost:8080',
-        apiKey: 'test-key',
-      });
-
-      assert.ok(Array.isArray(result));
-      assert.strictEqual(result.length, 1);
-      assert.strictEqual(result[0].embedderId, 'emb-1');
-    });
+  it('allows a file inside the directory', () => {
+    assert.ok(resolveUploadPath('ok.txt', dir).endsWith('ok.txt'));
   });
 
-  // ---- createSpace tool ----
+  it('is disabled entirely without an uploadDir', () => {
+    assert.throws(() => resolveUploadPath('/etc/hostname', undefined), /disabled/);
+  });
+});
 
-  describe('goodmem/create_space', () => {
-    it('should create a new space', async () => {
-      let callCount = 0;
-      globalThis.fetch = async (url: any) => {
-        callCount++;
-        const urlStr = typeof url === 'string' ? url : url.toString();
-        if (urlStr.endsWith('/v1/spaces') && callCount === 1) {
-          // listSpaces call: no matching space
-          return mockResponse({ spaces: [] });
-        }
-        // POST to create space
-        return mockResponse({
-          spaceId: 'new-space-id',
-          name: 'test-space',
-        });
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/create_space', {
-        name: 'test-space',
-        embedderId: 'emb-1',
-        chunkSize: 256,
-        chunkOverlap: 25,
-      });
-
-      assert.strictEqual(result.success, true);
-      assert.strictEqual(result.spaceId, 'new-space-id');
-      assert.strictEqual(result.reused, false);
-    });
-
-    it('should reuse an existing space with the same name', async () => {
-      globalThis.fetch = async () =>
-        mockResponse({
-          spaces: [{ spaceId: 'existing-id', name: 'test-space' }],
-        });
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/create_space', {
-        name: 'test-space',
-        embedderId: 'emb-1',
-      });
-
-      assert.strictEqual(result.success, true);
-      assert.strictEqual(result.spaceId, 'existing-id');
-      assert.strictEqual(result.reused, true);
-    });
-
-    it('should handle API error when creating space', async () => {
-      let callCount = 0;
-      globalThis.fetch = async () => {
-        callCount++;
-        if (callCount === 1) {
-          return mockResponse({ spaces: [] });
-        }
-        return mockErrorResponse(400, {
-          message: 'Invalid embedder ID',
-        });
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/create_space', {
-        name: 'test-space',
-        embedderId: 'invalid-emb',
-      });
-
-      assert.strictEqual(result.success, false);
-      assert.ok(result.error);
-    });
+describe('filters', () => {
+  it('escapes an apostrophe with a backslash, not by doubling', () => {
+    assert.equal(filters.equals('n', "o'brien"), "CAST(val('$.n') AS TEXT) = 'o\\'brien'");
   });
 
-  // ---- createMemory tool ----
-
-  describe('goodmem/create_memory', () => {
-    it('should create a memory from text content', async () => {
-      globalThis.fetch = async (url: any) => {
-        const urlStr = typeof url === 'string' ? url : url.toString();
-        if (urlStr.endsWith('/v1/memories')) {
-          return mockResponse({
-            memoryId: 'mem-123',
-            spaceId: 'sp-1',
-            processingStatus: 'PENDING',
-          });
-        }
-        return mockResponse({});
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/create_memory', {
-        spaceId: 'sp-1',
-        textContent: 'The capital of France is Paris.',
-        source: 'test',
-        author: 'tester',
-        tags: 'test,france',
-      });
-
-      assert.strictEqual(result.success, true);
-      assert.strictEqual(result.memoryId, 'mem-123');
-      assert.strictEqual(result.contentType, 'text/plain');
-    });
-
-    it('should fail gracefully when no content is provided', async () => {
-      globalThis.fetch = async () => mockResponse({});
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/create_memory', {
-        spaceId: 'sp-1',
-      });
-
-      assert.strictEqual(result.success, false);
-      assert.ok(result.error);
-      assert.match(result.error, /No content provided/);
-    });
-
-    it('should fail gracefully when file is not found', async () => {
-      globalThis.fetch = async () => mockResponse({});
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/create_memory', {
-        spaceId: 'sp-1',
-        filePath: '/nonexistent/file.pdf',
-      });
-
-      assert.strictEqual(result.success, false);
-      assert.ok(result.error);
-      assert.match(result.error, /File not found/);
-    });
-
-    it('should handle API error when creating memory', async () => {
-      globalThis.fetch = async () =>
-        mockErrorResponse(500, { message: 'Internal error' });
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/create_memory', {
-        spaceId: 'sp-1',
-        textContent: 'some text',
-      });
-
-      assert.strictEqual(result.success, false);
-      assert.ok(result.error);
-    });
+  it('refuses control characters', () => {
+    assert.throws(() => filters.equals('f', 'a\nb'), GoodMemFilterError);
   });
 
-  // ---- listMemories tool ----
-
-  describe('goodmem/list_memories', () => {
-    it('passes every set query parameter through the URL', async () => {
-      let capturedUrl = '';
-      globalThis.fetch = async (url: any) => {
-        capturedUrl = typeof url === 'string' ? url : url.toString();
-        return mockResponse({ memories: [] });
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      await callTool(ai, 'goodmem/list_memories', {
-        spaceId: 'sp-1',
-        statusFilter: 'COMPLETED',
-        includeContent: true,
-        sortBy: 'created_at',
-        sortOrder: 'DESCENDING',
-      });
-
-      assert.ok(
-        capturedUrl.startsWith(
-          'http://localhost:8080/v1/spaces/sp-1/memories?'
-        ),
-        `URL did not include a query string: ${capturedUrl}`
-      );
-      assert.match(capturedUrl, /statusFilter=COMPLETED/);
-      assert.match(capturedUrl, /includeContent=true/);
-      assert.match(capturedUrl, /sortBy=created_at/);
-      assert.match(capturedUrl, /sortOrder=DESCENDING/);
-    });
-
-    it('sends no query string when no optional filters are set', async () => {
-      let capturedUrl = '';
-      globalThis.fetch = async (url: any) => {
-        capturedUrl = typeof url === 'string' ? url : url.toString();
-        return mockResponse({ memories: [] });
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      await callTool(ai, 'goodmem/list_memories', { spaceId: 'sp-1' });
-
-      assert.strictEqual(
-        capturedUrl,
-        'http://localhost:8080/v1/spaces/sp-1/memories'
-      );
-    });
-
-    it('omits includeContent from the URL when set to false', async () => {
-      let capturedUrl = '';
-      globalThis.fetch = async (url: any) => {
-        capturedUrl = typeof url === 'string' ? url : url.toString();
-        return mockResponse({ memories: [] });
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      await callTool(ai, 'goodmem/list_memories', {
-        spaceId: 'sp-1',
-        includeContent: false,
-      });
-
-      assert.strictEqual(
-        capturedUrl,
-        'http://localhost:8080/v1/spaces/sp-1/memories'
-      );
-    });
-
-    it('keeps only the filters that are set', async () => {
-      let capturedUrl = '';
-      globalThis.fetch = async (url: any) => {
-        capturedUrl = typeof url === 'string' ? url : url.toString();
-        return mockResponse({ memories: [] });
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      await callTool(ai, 'goodmem/list_memories', {
-        spaceId: 'sp-1',
-        statusFilter: 'PENDING',
-      });
-
-      assert.ok(capturedUrl.includes('statusFilter=PENDING'));
-      assert.ok(!capturedUrl.includes('sortBy='));
-      assert.ok(!capturedUrl.includes('sortOrder='));
-      assert.ok(!capturedUrl.includes('includeContent='));
-    });
+  it('casts a boolean as BOOLEAN, never TEXT', () => {
+    assert.equal(filters.equals('a', true), "CAST(val('$.a') AS BOOLEAN) = true");
   });
 
-  // ---- retrieveMemories tool ----
-
-  describe('goodmem/retrieve_memories', () => {
-    it('should retrieve memories with NDJSON response', async () => {
-      const ndjsonLines = [
-        {
-          resultSetBoundary: { resultSetId: 'rs-1' },
-        },
-        {
-          retrievedItem: {
-            chunk: {
-              chunk: {
-                chunkId: 'c-1',
-                chunkText: 'Paris is the capital of France',
-                memoryId: 'mem-1',
-              },
-              relevanceScore: 0.95,
-              memoryIndex: 0,
-            },
-          },
-        },
-        {
-          memoryDefinition: {
-            memoryId: 'mem-1',
-            spaceId: 'sp-1',
-          },
-        },
-      ];
-
-      globalThis.fetch = async () => mockNdjsonResponse(ndjsonLines);
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/retrieve_memories', {
-        query: 'What is the capital of France?',
-        spaceIds: ['sp-1'],
-        maxResults: 5,
-        waitForIndexing: false,
-      });
-
-      assert.strictEqual(result.success, true);
-      assert.strictEqual(result.totalResults, 1);
-      assert.strictEqual(
-        result.results[0].chunkText,
-        'Paris is the capital of France'
-      );
-      assert.strictEqual(result.results[0].relevanceScore, 0.95);
-      assert.strictEqual(result.memories.length, 1);
-      assert.strictEqual(result.resultSetId, 'rs-1');
-    });
-
-    it('should fail with empty spaceIds', async () => {
-      globalThis.fetch = async () => mockResponse({});
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/retrieve_memories', {
-        query: 'test',
-        spaceIds: [],
-        waitForIndexing: false,
-      });
-
-      assert.strictEqual(result.success, false);
-      assert.match(result.error, /At least one space/);
-    });
-
-    it('should handle API error during retrieval', async () => {
-      globalThis.fetch = async () =>
-        mockErrorResponse(500, { message: 'Server error' });
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/retrieve_memories', {
-        query: 'test',
-        spaceIds: ['sp-1'],
-        waitForIndexing: false,
-      });
-
-      assert.strictEqual(result.success, false);
-      assert.ok(result.error);
-    });
-
-    it('applies metadataFilter to every spaceKey when set', async () => {
-      let capturedBody: any;
-      globalThis.fetch = async (_url: any, init: any) => {
-        capturedBody = JSON.parse(init.body as string);
-        return mockNdjsonResponse([
-          { resultSetBoundary: { resultSetId: 'rs-mf' } },
-          {
-            retrievedItem: {
-              chunk: {
-                chunk: {
-                  chunkId: 'c-1',
-                  chunkText: 'hello',
-                  memoryId: 'mem-1',
-                },
-                relevanceScore: 0.5,
-                memoryIndex: 0,
-              },
-            },
-          },
-        ]);
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const filter = "CAST(val('$.category') AS TEXT) = 'feat'";
-      await callTool(ai, 'goodmem/retrieve_memories', {
-        query: 'q',
-        spaceIds: ['sp-1', 'sp-2'],
-        metadataFilter: filter,
-        waitForIndexing: false,
-      });
-
-      assert.strictEqual(capturedBody.spaceKeys.length, 2);
-      for (const key of capturedBody.spaceKeys) {
-        assert.strictEqual(key.filter, filter);
-      }
-    });
-
-    it('omits the filter key from spaceKeys when metadataFilter is not set', async () => {
-      let capturedBody: any;
-      globalThis.fetch = async (_url: any, init: any) => {
-        capturedBody = JSON.parse(init.body as string);
-        return mockNdjsonResponse([
-          { resultSetBoundary: { resultSetId: 'rs-no-mf' } },
-        ]);
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      await callTool(ai, 'goodmem/retrieve_memories', {
-        query: 'q',
-        spaceIds: ['sp-1', 'sp-2'],
-        waitForIndexing: false,
-      });
-
-      assert.strictEqual(capturedBody.spaceKeys.length, 2);
-      for (const key of capturedBody.spaceKeys) {
-        assert.strictEqual(key.filter, undefined);
-      }
-    });
-
-    it('treats an empty metadataFilter the same as unset', async () => {
-      let capturedBody: any;
-      globalThis.fetch = async (_url: any, init: any) => {
-        capturedBody = JSON.parse(init.body as string);
-        return mockNdjsonResponse([
-          { resultSetBoundary: { resultSetId: 'rs-empty-mf' } },
-        ]);
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      await callTool(ai, 'goodmem/retrieve_memories', {
-        query: 'q',
-        spaceIds: ['sp-1'],
-        metadataFilter: '',
-        waitForIndexing: false,
-      });
-
-      assert.strictEqual(capturedBody.spaceKeys[0].filter, undefined);
-    });
-
-    it('respects custom maxWaitSeconds and pollInterval while polling', async () => {
-      let calls = 0;
-      globalThis.fetch = async () => {
-        calls++;
-        return mockNdjsonResponse([
-          { resultSetBoundary: { resultSetId: 'rs-empty' } },
-        ]);
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const start = Date.now();
-      const result = await callTool(ai, 'goodmem/retrieve_memories', {
-        query: 'q',
-        spaceIds: ['sp-1'],
-        waitForIndexing: true,
-        maxWaitSeconds: 0.5,
-        pollInterval: 0.1,
-      });
-      const elapsed = Date.now() - start;
-
-      assert.ok(
-        elapsed < 2000,
-        `expected polling to stop quickly, took ${elapsed}ms`
-      );
-      assert.ok(
-        calls >= 2,
-        `expected polling to call fetch more than once, got ${calls}`
-      );
-      assert.strictEqual(result.success, true);
-      assert.strictEqual(result.totalResults, 0);
-      assert.match(result.message ?? '', /No results found/);
-    });
-
-    it('skips the polling loop when waitForIndexing is false', async () => {
-      let calls = 0;
-      globalThis.fetch = async () => {
-        calls++;
-        return mockNdjsonResponse([
-          { resultSetBoundary: { resultSetId: 'rs-skip' } },
-        ]);
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/retrieve_memories', {
-        query: 'q',
-        spaceIds: ['sp-1'],
-        waitForIndexing: false,
-      });
-
-      assert.strictEqual(calls, 1);
-      assert.strictEqual(result.success, true);
-      assert.strictEqual(result.totalResults, 0);
-    });
-
-    it('should handle abstractReply in NDJSON response', async () => {
-      const ndjsonLines = [
-        {
-          resultSetBoundary: { resultSetId: 'rs-2' },
-        },
-        {
-          retrievedItem: {
-            chunk: {
-              chunk: {
-                chunkId: 'c-1',
-                chunkText: 'Some text',
-                memoryId: 'mem-1',
-              },
-              relevanceScore: 0.9,
-              memoryIndex: 0,
-            },
-          },
-        },
-        {
-          abstractReply: {
-            text: 'Based on the context, the answer is...',
-          },
-        },
-      ];
-
-      globalThis.fetch = async () => mockNdjsonResponse(ndjsonLines);
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/retrieve_memories', {
-        query: 'test query',
-        spaceIds: ['sp-1'],
-        waitForIndexing: false,
-      });
-
-      assert.strictEqual(result.success, true);
-      assert.ok(result.abstractReply);
-      assert.strictEqual(
-        result.abstractReply.text,
-        'Based on the context, the answer is...'
-      );
-    });
+  it('casts a number as NUMERIC', () => {
+    assert.match(filters.equals('year', 2026), /AS NUMERIC/);
   });
 
-  // ---- getMemory tool ----
-
-  describe('goodmem/get_memory', () => {
-    it('should get a memory by ID', async () => {
-      let callCount = 0;
-      globalThis.fetch = async (url: any) => {
-        callCount++;
-        const urlStr = typeof url === 'string' ? url : url.toString();
-        if (urlStr.includes('/content')) {
-          return mockResponse({
-            contentType: 'text/plain',
-            content: 'Hello world',
-          });
-        }
-        return mockResponse({
-          memoryId: 'mem-123',
-          spaceId: 'sp-1',
-          processingStatus: 'COMPLETED',
-        });
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/get_memory', {
-        memoryId: 'mem-123',
-        includeContent: true,
-      });
-
-      assert.strictEqual(result.success, true);
-      assert.ok(result.memory);
-      assert.strictEqual(result.memory.memoryId, 'mem-123');
-      assert.ok(result.content);
-    });
-
-    it('should handle content fetch failure gracefully', async () => {
-      let callCount = 0;
-      globalThis.fetch = async (url: any) => {
-        callCount++;
-        const urlStr = typeof url === 'string' ? url : url.toString();
-        if (urlStr.includes('/content')) {
-          return mockErrorResponse(404, { message: 'Content not found' });
-        }
-        return mockResponse({
-          memoryId: 'mem-123',
-          spaceId: 'sp-1',
-        });
-      };
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/get_memory', {
-        memoryId: 'mem-123',
-        includeContent: true,
-      });
-
-      assert.strictEqual(result.success, true);
-      assert.ok(result.memory);
-      assert.ok(result.contentError);
-    });
-
-    it('should return error for invalid memory ID', async () => {
-      globalThis.fetch = async () =>
-        mockErrorResponse(404, { message: 'Memory not found' });
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/get_memory', {
-        memoryId: '00000000-0000-0000-0000-000000000000',
-      });
-
-      assert.strictEqual(result.success, false);
-      assert.ok(result.error);
-    });
+  it('refuses an unsafe field name', () => {
+    assert.throws(() => filters.equals("a' OR '1", 'x'), GoodMemFilterError);
   });
 
-  // ---- deleteMemory tool ----
-
-  describe('goodmem/delete_memory', () => {
-    it('should delete a memory successfully', async () => {
-      globalThis.fetch = async () => mockResponse({});
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/delete_memory', {
-        memoryId: 'mem-123',
-      });
-
-      assert.strictEqual(result.success, true);
-      assert.strictEqual(result.memoryId, 'mem-123');
-    });
-
-    it('should return error for invalid memory ID', async () => {
-      globalThis.fetch = async () =>
-        mockErrorResponse(404, { message: 'Memory not found' });
-
-      const ai = genkit({
-        plugins: [
-          goodmem({
-            baseUrl: 'http://localhost:8080',
-            apiKey: 'test-key',
-          }),
-        ],
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      const result = await callTool(ai, 'goodmem/delete_memory', {
-        memoryId: '00000000-0000-0000-0000-000000000000',
-      });
-
-      assert.strictEqual(result.success, false);
-      assert.ok(result.error);
-    });
+  it('builds comparisons and sets', () => {
+    assert.match(filters.compare('year', '>=', 2000), />= 2000$/);
+    assert.match(filters.oneOf('tag', ['a', 'b']), /IN \(/);
   });
 
-  // ---- API headers ----
-
-  describe('API headers', () => {
-    it('should send correct headers with API key', async () => {
-      let capturedHeaders: Record<string, string> = {};
-      globalThis.fetch = async (_url: any, init: any) => {
-        capturedHeaders = init?.headers || {};
-        return mockResponse({ spaces: [] });
-      };
-
-      await listSpaces({
-        baseUrl: 'http://localhost:8080',
-        apiKey: 'gm_test_api_key',
-      });
-
-      assert.strictEqual(capturedHeaders['X-API-Key'], 'gm_test_api_key');
-      assert.strictEqual(capturedHeaders['Content-Type'], 'application/json');
-      assert.strictEqual(capturedHeaders['Accept'], 'application/json');
-    });
+  it('refuses mixed types in oneOf', () => {
+    assert.throws(() => filters.oneOf('tag', ['a', 1]), GoodMemFilterError);
   });
 
-  // ---- URL normalization ----
-
-  describe('URL normalization', () => {
-    it('should strip trailing slash from baseUrl', async () => {
-      let capturedUrl = '';
-      globalThis.fetch = async (url: any) => {
-        capturedUrl = typeof url === 'string' ? url : url.toString();
-        return mockResponse({ spaces: [] });
-      };
-
-      await listSpaces({
-        baseUrl: 'http://localhost:8080/',
-        apiKey: 'test-key',
-      });
-
-      assert.strictEqual(capturedUrl, 'http://localhost:8080/v1/spaces');
-    });
+  it('reaches the request as a space key filter', async () => {
+    const capture: { body?: any } = {};
+    serveRetrieve(fixture('retrieve_ok.ndjson'), capture);
+    await callTool(makeAi({ metadataFilter: { tenant: 'acme' } }), 'search', { query: 'q', topK: 1 });
+    assert.equal(capture.body.spaceKeys[0].filter, "CAST(val('$.tenant') AS TEXT) = 'acme'");
   });
 });

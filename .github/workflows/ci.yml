@@ -1,0 +1,86 @@
+# Tests, types and the gates. 0.1.2 shipped to npm with only a publish
+# workflow: its 34 passing tests hand-built Response objects whose .json()
+# always worked, which is why they were green against a content path that
+# failed on every memory.
+
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20.x", "22.x"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install
+        run: npm ci || npm install
+
+      - name: Types
+        run: npx tsc --noEmit
+
+      - name: Offline suite
+        run: npm test
+
+      - name: Live tests must skip without credentials
+        env:
+          GOODMEM_API_KEY: ""
+          GOODMEM_BASE_URL: ""
+        run: |
+          set -euo pipefail
+          npm run test:live > live.log 2>&1
+          grep -q "SKIP" live.log
+          if grep -qE "^\s*ok [0-9]+ - (an exact|hits carry)" live.log; then
+            echo "A live test ran without credentials -- a key may be baked in."
+            exit 1
+          fi
+
+      - name: Build, then require the built package in a clean directory
+        run: |
+          set -euo pipefail
+          npm run build
+          PKG=$(npm pack --silent)
+          mkdir -p /tmp/clean && mv "$PKG" /tmp/clean/
+          cd /tmp/clean
+          npm init -y >/dev/null
+          npm install "./$PKG" genkit >/dev/null
+          node -e "const m=require('genkitx-goodmem'); if(!m.goodmem) throw new Error('no goodmem export'); console.log('ok')"
+
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No GoodMem API key in any tracked file
+        run: |
+          set -euo pipefail
+          if git ls-files -z | xargs -0 grep -IEn "gm_[a-z0-9]{20,}" ; then
+            echo "A GoodMem API key is committed to this repository."
+            exit 1
+          fi
+          echo "No credential-shaped string in any tracked file."
+
+      - name: TLS verification is never disabled in shipped code
+        run: |
+          set -euo pipefail
+          if grep -rIn "NODE_TLS_REJECT_UNAUTHORIZED" src 2>/dev/null ; then
+            echo "TLS verification is disabled in shipped code."
+            exit 1
+          fi
+          echo "No disabled TLS in src."

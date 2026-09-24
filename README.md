@@ -1,29 +1,26 @@
 # genkitx-goodmem
 
-[GoodMem](https://goodmem.ai) plugin for
-[Genkit](https://genkit.dev).
+[GoodMem](https://docs.goodmem.ai) memory for [Genkit](https://genkit.dev):
+a native retriever and indexer, plus agent tools. Documents are chunked,
+embedded and searched server-side; this plugin wraps the official
+`@pairsystems/goodmem` SDK.
 
-GoodMem gives AI agents retrieval-augmented generation (RAG) memory. Store documents in a space and GoodMem chunks, embeds, and indexes them so your agent can pull back the most relevant passages on any question.
+**Version 0.2.0.** Verified against GoodMem server **v1.0.320**.
 
-This package exposes the GoodMem API as 11 Genkit tools under the `goodmem/` namespace, callable from any Genkit agent or flow.
+> **Upgrading from 0.1.2.** 0.1.2 talked to GoodMem over hand-written `fetch`.
+> Two defects stand out: `get_memory` with `includeContent` called `.json()`
+> on a body the server returns as `text/plain`, so it **failed for every
+> memory**; and a retrieval that failed — a space whose embedder was
+> unavailable, say — returned `success: true` with zero results and no
+> indication anything was wrong. See [Changes in 0.2.0](#changes-in-020).
 
-## Installation
+## Install
 
 ```bash
 npm install genkitx-goodmem
-# or
-pnpm add genkitx-goodmem
-# or
-yarn add genkitx-goodmem
 ```
 
-`genkit` is a peer dependency. If you do not already have it installed:
-
-```bash
-npm install genkit
-```
-
-## Quickstart
+## Use
 
 ```ts
 import { genkit } from 'genkit';
@@ -32,161 +29,157 @@ import { goodmem } from 'genkitx-goodmem';
 const ai = genkit({
   plugins: [
     goodmem({
-      baseUrl: process.env.GOODMEM_BASE_URL || 'https://localhost:8080',
+      baseUrl: process.env.GOODMEM_BASE_URL!,
       apiKey: process.env.GOODMEM_API_KEY!,
+      spaceIds: ['<space-uuid>'],
     }),
   ],
 });
 ```
 
-Once the plugin is loaded, 11 tools are registered and available to any Genkit agent or flow.
+`spaceIds` is required: the model never chooses a space.
 
-## Tool naming
-
-All tools sit under the `goodmem/` namespace and use snake_case action names. For example: `goodmem/create_space`, `goodmem/list_embedders`. The `<plugin>/<action>` shape follows Genkit's convention.
-
-## Available tools
-
-| Tool | Description |
-|---|---|
-| `goodmem/list_embedders` | List embedder models available on the server. |
-| `goodmem/list_spaces` | List spaces visible to the API key. |
-| `goodmem/get_space` | Fetch a space by UUID. |
-| `goodmem/create_space` | Create a space (idempotent by name). |
-| `goodmem/update_space` | Rename, retag, or change the public-read flag on a space. |
-| `goodmem/delete_space` | Delete a space and every memory in it. |
-| `goodmem/create_memory` | Store text or a file as a memory. |
-| `goodmem/list_memories` | List memories in a space, with status/sort filters. |
-| `goodmem/retrieve_memories` | Semantic retrieval across one or more spaces. |
-| `goodmem/get_memory` | Fetch a memory by UUID, optionally with content. |
-| `goodmem/delete_memory` | Delete a memory. |
-
-### Retrieval options
-
-`goodmem/retrieve_memories` accepts the following parameters in addition to `query`, `spaceIds`, and `maxResults`:
-
-| Parameter | Type | Description |
-|---|---|---|
-| `metadataFilter` | string | SQL-style JSONPath filter applied server-side to every space key. Example: `CAST(val('$.category') AS TEXT) = 'feat'` |
-| `waitForIndexing` | boolean | Poll for results when none come back on the first call (default `true`). |
-| `maxWaitSeconds` | number | Polling budget in seconds (default `10`). |
-| `pollInterval` | number | Seconds between polls (default `2`). |
-| `rerankerId` | string | Reranker model UUID to refine result ordering. |
-| `llmId` | string | LLM UUID that generates a contextual abstract reply. |
-| `relevanceThreshold` | number | Minimum score (0-1) for inclusion. Only used with a reranker or LLM. |
-| `llmTemperature` | number | Creativity (0-2) for the LLM post-processor. Only used with `llmId`. |
-| `chronologicalResort` | boolean | Reorder results by creation time instead of relevance. |
-| `includeMemoryDefinition` | boolean | Fetch full memory metadata alongside matched chunks (default `true`). |
-
-### `list_memories` options
-
-| Parameter | Type | Description |
-|---|---|---|
-| `statusFilter` | `"PENDING" \| "PROCESSING" \| "COMPLETED" \| "FAILED"` | Restrict results to one processing status. |
-| `includeContent` | boolean | Include original document content alongside metadata (default `false`). |
-| `sortBy` | `"created_at" \| "updated_at"` | Field used to sort the returned memories. |
-| `sortOrder` | `"ASCENDING" \| "DESCENDING"` | Sort direction. |
-
-## Environment variables
-
-| Variable | Description |
-|---|---|
-| `GOODMEM_BASE_URL` | Base URL of the GoodMem API server. Default in examples: `https://localhost:8080`. |
-| `GOODMEM_API_KEY` | API key sent as the `X-API-Key` header. |
-| `NODE_TLS_REJECT_UNAUTHORIZED` | Set to `0` for local dev with a self-signed certificate. Node's `fetch` reads it directly. |
-
-## Helper functions
-
-The plugin also exports two helper functions for direct programmatic use. The `goodmem/list_spaces` and `goodmem/list_embedders` tools call into these:
+### Retrieve and index
 
 ```ts
-import { listSpaces, listEmbedders } from 'genkitx-goodmem';
-
-const spaces = await listSpaces({
-  baseUrl: 'https://localhost:8080',
-  apiKey: process.env.GOODMEM_API_KEY!,
+const docs = await ai.retrieve({
+  retriever: 'goodmem/memories',
+  query: 'What is the main finding?',
+  options: { k: 5 },
 });
 
-const embedders = await listEmbedders({
-  baseUrl: 'https://localhost:8080',
-  apiKey: process.env.GOODMEM_API_KEY!,
-});
+await ai.index({ indexer: 'goodmem/memories', documents: [Document.fromText('...')] });
 ```
 
-## Example: full workflow
+0.1.2 registered neither, so GoodMem could not be used with Genkit's RAG paths
+at all — it was tools only.
+
+Each document carries its GoodMem provenance in metadata:
 
 ```ts
-import { genkit, z } from 'genkit';
-import { goodmem } from 'genkitx-goodmem';
+{
+  goodmem_chunk_id, goodmem_memory_id, goodmem_space_id,
+  goodmem_score,        // higher is better
+  goodmem_raw_score,    // exactly what the server sent
+  goodmem_score_kind,   // 'vector' | 'reranker' -- not the same scale
+  goodmem_partial,      // true when the server reported a problem
+  goodmem_statuses,     // present when partial
+  ...the memory's own metadata
+}
+```
 
-const ai = genkit({
-  plugins: [
-    goodmem({
-      baseUrl: 'https://localhost:8080',
-      apiKey: process.env.GOODMEM_API_KEY!,
-    }),
-  ],
-});
+### Tools
 
-const memoryFlow = ai.defineFlow(
-  { name: 'memoryFlow', inputSchema: z.string(), outputSchema: z.any() },
-  async (query) => {
-    const listEmbedders = await ai.registry.lookupAction(
-      '/tool/goodmem/list_embedders'
-    );
-    const { embedders } = await listEmbedders({});
-    const embedderId = embedders[0].embedderId;
+By default the model sees exactly two:
 
-    const createSpace = await ai.registry.lookupAction(
-      '/tool/goodmem/create_space'
-    );
-    const space = await createSpace({
-      name: 'my-knowledge-base',
-      embedderId,
-    });
+| Tool | What the model may pass |
+| --- | --- |
+| `goodmem/search` | `query`, `topK` |
+| `goodmem/remember` | `text` |
 
-    const createMemory = await ai.registry.lookupAction(
-      '/tool/goodmem/create_memory'
-    );
-    await createMemory({
-      spaceId: space.spaceId,
-      textContent: 'The capital of France is Paris.',
-      source: 'manual',
-    });
+Everything else is opt-in, because a model does not need to administer a
+memory server in order to use one. 0.1.2 exposed eleven tools, including
+`goodmem/delete_space`.
 
-    const retrieve = await ai.registry.lookupAction(
-      '/tool/goodmem/retrieve_memories'
-    );
-    return retrieve({
-      query,
-      spaceIds: [space.spaceId],
-      maxResults: 5,
-    });
-  }
+| Option | Adds |
+| --- | --- |
+| `uploadDir: '<dir>'` | `goodmem/upload_file`, confined to that directory |
+| `allowAdminTools: true` | space/embedder management, `get_memory`, `list_memories` |
+| `allowDelete: true` | `delete_memory`, `delete_space` |
+| `allowWrite: false` | removes `goodmem/remember` |
+
+## When retrieval goes wrong
+
+`partial` means exactly one thing: **the server reported a real problem during
+this retrieval.** It is independent of whether hits came back. A degraded
+search still returns whatever arrived, flagged; when nothing usable arrives
+the result is empty, `partial` is set, a `warning` is included, and the plugin
+logs at WARNING with the server's own reason. A failed search is never
+presented as an empty one.
+
+A request that never yields a single event — a dead connection, a refused
+handshake — **throws**, rather than being reported as a search that found
+nothing.
+
+### Scores
+
+GoodMem produces two kinds of score and they are not comparable. **Vector**
+scores are negative distances, so `goodmem_score` is the flipped value with
+`goodmem_raw_score` kept beside it. **Reranker** scores are already
+higher-is-better, on a **provider-dependent** scale — measured live on the
+same five documents, Voyage `rerank-2.5` returned `0.27..0.93` and Jina
+`jina-reranker-v3` returned `-0.14..0.43`.
+
+So there is **no default threshold**; `minScore` applies only when
+`rerankerId` is set, and warns naming the observed range if it removes
+everything.
+
+## Metadata filters
+
+Filters are expressions evaluated server-side, not SQL. They are set by the
+developer, never by the model:
+
+```ts
+import { filters, goodmem } from 'genkitx-goodmem';
+
+goodmem({ /* ... */, metadataFilter: { tenant: 'acme', active: true } });
+
+const expression = filters.allOf(
+  filters.equals('tenant', 'acme'),
+  filters.compare('year', '>=', 2026),
 );
 ```
 
-## End-to-end demo
+The helper applies the escaping the server accepts (`'` → `\'`, `\` → `\\`;
+SQL-style `''` doubling is rejected with HTTP 400), refuses control
+characters, restricts field names, and casts each value to the type GoodMem
+stored — a boolean compared as `TEXT` is accepted with HTTP 200 and matches
+nothing.
 
-[`examples/example_usage.ts`](examples/example_usage.ts) walks through three scenarios: persistent project context, a scribe and analyst pipeline, and metadata-driven retrieval. The answering step uses OpenAI via `@genkit-ai/compat-oai`. Set `OPENAI_API_KEY` before running.
+## Uploads
+
+Uploads are **off** unless you set `uploadDir`. When set, every path is
+resolved (symlinks included) and refused if it lands outside that directory,
+so a model-supplied path cannot read arbitrary host files.
+
+## Changes in 0.2.0
+
+Reproduced against the published 0.1.2 package, live against GoodMem v1.0.320.
+
+| Was | Now |
+| --- | --- |
+| Hand-written `fetch` client | Official `@pairsystems/goodmem` SDK |
+| `get_memory({includeContent:true})` called `.json()` on `text/plain` and **failed for every memory**, returning `success: true` with a `contentError` string | Decoded by content type: text as text, anything else base64. A failed fetch raises |
+| A space with a failing embedder returned `success: true, totalResults: 0` — `EMBEDDER_FAILED` was dropped | `partial` + `statuses` + a warning carrying the server's reason |
+| No retriever and no indexer — unusable with Genkit RAG | `goodmem/memories` registered as both |
+| `publicRead` was a tool argument; the server answers `400 Unrecognized field "publicRead"` | Not offered anywhere |
+| Eleven tools including `delete_space` | `goodmem/search` + `goodmem/remember`; the rest opt-in |
+| `filePath` was an unrestricted tool argument; it read `/etc/hostname` and uploaded it | Confined to `uploadDir`; `..` and symlink escapes refused |
+| Empty search took **23.4 s** — `waitForIndexing` on by default | **under a second**; the read path never polls |
+| **No request carried a timeout** — no `AbortController` anywhere | `timeoutMs`, default 30s |
+| Chunks and memories joined by positional `memoryIndex` | Joined by UUID, de-duplicated by chunk id |
+| Raw negative scores | oriented score + raw + kind |
+| Reusing a space name accepted any embedder | Reuse requires a match; a mismatch names both |
+| `nextToken` appeared nowhere — listings returned one page | Paginated, bounded by `maxListItems` |
+| 34 tests over hand-built `Response` objects; no CI | 40 offline + 14 live; CI on Node 20 and 22 |
+
+## Tests
+
+| Suite | Count | Needs |
+| --- | --- | --- |
+| `tests/goodmem_test.ts` | 40 | nothing — the real SDK over a mocked `fetch`, fed NDJSON captured from a live server |
+| `tests/goodmem_live_test.ts` | 14 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
-# from a checkout of this repo:
-pnpm install
-pnpm run demo
-# or to inspect traces in the Genkit Developer UI:
-genkit start -- tsx examples/example_usage.ts
+npm install
+npm test          # offline
+npm run test:live # live; set GOODMEM_TEST_EMBEDDER_ID to pin an embedder
+npx tsc --noEmit  # types, as CI runs them
 ```
 
-## Testing
-
-Run the unit test suite (mocked `fetch`, exercises every tool):
-
-```bash
-pnpm install
-pnpm run test
-```
+The live suite creates one space per run and asserts, against a fresh
+listing, that it is gone afterwards.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache-2.0.

@@ -15,7 +15,7 @@
     "genai",
     "generative-ai"
   ],
-  "version": "0.1.2",
+  "version": "0.2.0",
   "type": "commonjs",
   "scripts": {
     "check": "tsc",
@@ -24,7 +24,8 @@
     "build": "npm-run-all build:clean check compile",
     "build:watch": "tsup-node --watch",
     "test": "tsx --test tests/goodmem_test.ts",
-    "demo": "tsx examples/example_usage.ts"
+    "demo": "tsx examples/example_usage.ts",
+    "test:live": "tsx --test tests/goodmem_live_test.ts"
   },
   "homepage": "https://github.com/PAIR-Systems-Inc/goodmem_genkit",
   "repository": {
@@ -38,7 +39,9 @@
   "engines": {
     "node": ">=20"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@pairsystems/goodmem": "^0.1.7"
+  },
   "peerDependencies": {
     "genkit": "^1.0.0"
   },

@@ -5,7 +5,7 @@ a native retriever and indexer, plus agent tools. Documents are chunked,
 embedded and searched server-side; this plugin wraps the official
 `@pairsystems/goodmem` SDK.
 
-**Version 0.2.0.** Verified against GoodMem server **v1.0.320**.
+**Version 0.2.1.** Verified against GoodMem server **v1.0.320**.
 
 > **Upgrading from 0.1.2.** 0.1.2 talked to GoodMem over hand-written `fetch`.
 > Two defects stand out: `get_memory` with `includeContent` called `.json()`
@@ -13,6 +13,11 @@ embedded and searched server-side; this plugin wraps the official
 > memory**; and a retrieval that failed — a space whose embedder was
 > unavailable, say — returned `success: true` with zero results and no
 > indication anything was wrong. See [Changes in 0.2.0](#changes-in-020).
+
+> **Upgrading from 0.2.0.** Every id is now required to be a UUID, checked
+> before any request is made: a model-supplied `memoryId` of `..` sent
+> `DELETE /v1/`. A non-UUID in `spaceIds` or `rerankerId` now throws when the
+> plugin is created. See [Ids are UUIDs](#ids-are-uuids).
 
 ## Install
 
@@ -88,6 +93,21 @@ memory server in order to use one. 0.1.2 exposed eleven tools, including
 | `allowDelete: true` | `delete_memory`, `delete_space` |
 | `allowWrite: false` | removes `goodmem/remember` |
 
+The id each opt-in tool takes — `memoryId`, `spaceId`, `embedderId` — is
+declared to the model as a UUID (`format: uuid`).
+
+## Ids are UUIDs
+
+Every GoodMem id this plugin sends — a memory, space, embedder or reranker id,
+whether a model, your code or the plugin configuration supplied it — must be a
+canonical UUID; anything else is refused with a `GoodMemError` naming the
+field, before any request is made, because ids are part of the URL path
+(`/v1/memories/{id}`) and a value such as `../spaces/<id>` could otherwise
+address a different resource than the one named. An upper-case UUID is
+accepted and sent lower-cased. The check sits at the call that sends the id,
+so the tools, the retriever and indexer, and `GoodMemConnection`'s own methods
+are all covered; the model-visible schema only tells the model.
+
 ## When retrieval goes wrong
 
 `partial` means exactly one thing: **the server reported a real problem during
@@ -142,6 +162,22 @@ Uploads are **off** unless you set `uploadDir`. When set, every path is
 resolved (symlinks included) and refused if it lands outside that directory,
 so a model-supplied path cannot read arbitrary host files.
 
+## Changes in 0.2.1
+
+Measured by driving the real SDK against a local server that records every
+request it receives (`tests/goodmem_ids_test.ts`, run against 0.2.0 and 0.2.1).
+`<U>` is a space id.
+
+| Was | Now |
+| --- | --- |
+| `goodmem/delete_memory` with `memoryId: "../spaces/<U>"`, called by a model through `ai.generate`, sent `DELETE /v1/memories/..%2Fspaces%2F<U>` and the tool answered `success: true` | Refused: `memoryId must be a UUID`; the server receives nothing |
+| `memoryId: ".."` sent `DELETE /v1/` and `"."` sent `DELETE /v1/memories/` — the SDK's `encodeURIComponent` turns `/` into `%2F` but leaves a bare dot segment for the URL parser to resolve | Refused; nothing sent |
+| `list_memories` with `spaceId: ".."` sent `GET /v1/memories` | Refused; nothing sent |
+| Any string reached the URL, percent-encoded: `" <U>"`, `"<U>?x=1"`, `"<U>#frag"`, `"%2e%2e/spaces/<U>"`, `"urn:uuid:<U>"` — across `get_memory`, `delete_memory`, `get_space`, `update_space`, `delete_space`, `list_memories` and the matching `GoodMemConnection` methods | Only a canonical UUID reaches a request |
+| A non-UUID in `spaceIds` was sent in every retrieval and write body; `create_space` sent any `embedderId` | Refused when the plugin is created, and again at every call |
+| `rerankerId: ""` was silently read as "no reranker" | Refused; leave it unset instead |
+| Tool id arguments were declared as a bare `string` | Declared `format: uuid` |
+
 ## Changes in 0.2.0
 
 Reproduced against the published 0.1.2 package, live against GoodMem v1.0.320.
@@ -167,8 +203,9 @@ Reproduced against the published 0.1.2 package, live against GoodMem v1.0.320.
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/goodmem_test.ts` | 40 | nothing — the real SDK over a mocked `fetch`, fed NDJSON captured from a live server |
-| `tests/goodmem_live_test.ts` | 14 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
+| `tests/goodmem_test.ts` | 43 | nothing — the real SDK over a mocked `fetch`, fed NDJSON captured from a live server |
+| `tests/goodmem_ids_test.ts` | 56 | nothing — the real SDK over real HTTP to a local server that records every request; every id-taking entry point, fourteen malformed ids each |
+| `tests/goodmem_live_test.ts` | 15 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
 npm install

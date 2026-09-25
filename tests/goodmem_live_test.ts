@@ -168,14 +168,25 @@ describe('live', { skip }, () => {
   });
 
   it("carries the server's own message on a rejected create", async () => {
-    await assert.rejects(
-      () => conn.createSpace(`gk-live-bad-${RUN}`, 'not-a-uuid'),
-      (err: any) => {
-        assert.equal(err.statusCode, 400);
-        assert.match(String(err.message).toLowerCase(), /embedder/);
-        return true;
-      }
-    );
+    // A well-formed id that names no embedder, so the server -- not the
+    // plugin's UUID check -- is what rejects it.
+    let error: any;
+    let created: any;
+    try {
+      created = await conn.createSpace(`gk-live-bad-${RUN}`, '00000000-0000-4000-8000-000000000000');
+    } catch (err) {
+      error = err;
+    }
+    if (created) await conn.deleteSpace(created.spaceId);
+    assert.ok(error, 'a space was created with an embedder that does not exist');
+    assert.ok(error.statusCode >= 400 && error.statusCode < 500, `HTTP ${error.statusCode}`);
+    assert.match(String(error.message).toLowerCase(), /embedder/);
+  });
+
+  it('refuses a malformed id without sending it', async () => {
+    await assert.rejects(() => conn.createSpace(`gk-live-bad-${RUN}`, 'not-a-uuid'), /embedderId must be a UUID/);
+    await assert.rejects(() => conn.deleteSpace(`../spaces/${spaceId}`), /spaceId must be a UUID/);
+    assert.equal((await conn.getSpace(spaceId)).spaceId, spaceId, 'the space is gone');
   });
 
   it('decodes text content as text', async () => {

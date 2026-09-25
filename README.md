@@ -18,6 +18,10 @@ embedded and searched server-side; this plugin wraps the official
 > before any request is made: a model-supplied `memoryId` of `..` sent
 > `DELETE /v1/`. A non-UUID in `spaceIds` or `rerankerId` now throws when the
 > plugin is created. See [Ids are UUIDs](#ids-are-uuids).
+>
+> 0.2.0 also failed **every** retrieval when `rerankerId` was set (HTTP 400
+> `Unrecognized field "rerankerId"`); 0.2.1 sends the reranker as a
+> post-processor. See [Changes in 0.2.1](#changes-in-021).
 
 ## Install
 
@@ -47,6 +51,8 @@ const ai = genkit({
 ### Retrieve and index
 
 ```ts
+import { Document } from 'genkit';
+
 const docs = await ai.retrieve({
   retriever: 'goodmem/memories',
   query: 'What is the main finding?',
@@ -59,19 +65,21 @@ await ai.index({ indexer: 'goodmem/memories', documents: [Document.fromText('...
 0.1.2 registered neither, so GoodMem could not be used with Genkit's RAG paths
 at all — it was tools only.
 
-Each document carries its GoodMem provenance in metadata:
+Each document carries the memory's own metadata plus its GoodMem provenance:
 
-```ts
-{
-  goodmem_chunk_id, goodmem_memory_id, goodmem_space_id,
-  goodmem_score,        // higher is better
-  goodmem_raw_score,    // exactly what the server sent
-  goodmem_score_kind,   // 'vector' | 'reranker' -- not the same scale
-  goodmem_partial,      // true when the server reported a problem
-  goodmem_statuses,     // present when partial
-  ...the memory's own metadata
-}
-```
+| Key | Value |
+| --- | --- |
+| `goodmem_chunk_id`, `goodmem_memory_id`, `goodmem_space_id` | where this hit came from |
+| `goodmem_score` | higher is better |
+| `goodmem_raw_score` | exactly what the server sent |
+| `goodmem_score_kind` | `'vector'` or `'reranker'` — not the same scale |
+| `goodmem_partial` | true when the server reported a problem |
+| `goodmem_statuses` | present when partial |
+
+The `goodmem_*` prefix is reserved. These keys always describe *this*
+retrieval: a memory's own metadata cannot override them, and the indexer
+drops them before storing a document, so a retrieved document indexed again
+(a copy, a cache, a migration) reports the copy's ids, not the original's.
 
 ### Tools
 
@@ -130,9 +138,24 @@ higher-is-better, on a **provider-dependent** scale — measured live on the
 same five documents, Voyage `rerank-2.5` returned `0.27..0.93` and Jina
 `jina-reranker-v3` returned `-0.14..0.43`.
 
-So there is **no default threshold**; `minScore` applies only when
-`rerankerId` is set, and warns naming the observed range if it removes
-everything.
+So there is **no default threshold**. `minScore` applies only to reranker
+scores, and warns naming the observed range if it removes everything:
+
+```ts
+goodmem({
+  baseUrl: process.env.GOODMEM_BASE_URL!,
+  apiKey: process.env.GOODMEM_API_KEY!,
+  spaceIds: ['<space-uuid>'],
+  rerankerId: '<reranker-uuid>',
+  minScore: 0.5,
+});
+```
+
+Whether hits were reranked is read from the response, not from the
+configuration. When the reranker fails the server reports `RERANKING_FAILED`
+(or `NOT_FOUND` for the reranker) and still returns the vector-scored hits it
+had; those come back as `vector` scores, flipped, **not** filtered by
+`minScore`, with `partial` set and the statuses attached.
 
 ## Metadata filters
 
@@ -142,7 +165,12 @@ developer, never by the model:
 ```ts
 import { filters, goodmem } from 'genkitx-goodmem';
 
-goodmem({ /* ... */, metadataFilter: { tenant: 'acme', active: true } });
+goodmem({
+  baseUrl: process.env.GOODMEM_BASE_URL!,
+  apiKey: process.env.GOODMEM_API_KEY!,
+  spaceIds: ['<space-uuid>'],
+  metadataFilter: { tenant: 'acme', active: true },
+});
 
 const expression = filters.allOf(
   filters.equals('tenant', 'acme'),
@@ -165,8 +193,9 @@ so a model-supplied path cannot read arbitrary host files.
 ## Changes in 0.2.1
 
 Measured by driving the real SDK against a local server that records every
-request it receives (`tests/goodmem_ids_test.ts`, run against 0.2.0 and 0.2.1).
-`<U>` is a space id.
+request it receives (`tests/goodmem_ids_test.ts` and
+`tests/goodmem_rerank_test.ts`, run against 0.2.0 and 0.2.1). `<U>` is a
+space id.
 
 | Was | Now |
 | --- | --- |
@@ -177,6 +206,9 @@ request it receives (`tests/goodmem_ids_test.ts`, run against 0.2.0 and 0.2.1).
 | A non-UUID in `spaceIds` was sent in every retrieval and write body; `create_space` sent any `embedderId` | Refused when the plugin is created, and again at every call |
 | `rerankerId: ""` was silently read as "no reranker" | Refused; leave it unset instead |
 | Tool id arguments were declared as a bare `string` | Declared `format: uuid` |
+| With any `rerankerId` set, **every** retrieval — `ai.retrieve`, `goodmem/search`, `minScore` — failed with HTTP 400 `Unrecognized field "rerankerId" (class com.goodmem.rest.dto.RetrieveMemoryRequest)`: the SDK translates `rerankerId` only in its `(message, options)` form | Sent as `postProcessor: {name: "com.goodmem.retrieval.postprocess.ChatPostProcessorFactory", config: {reranker_id}}`; per-space filters stay in `spaceKeys` |
+| With a reranker configured, a failed rerank (`RERANKING_FAILED`, reranker `NOT_FOUND`) returned the server's vector fallback hits labelled `reranker` and unflipped (`-0.5846`), and any `minScore` discarded all of them | Labelled `vector`, flipped (`0.5846`), kept, `partial` with the statuses |
+| Memory metadata overrode `goodmem_*` provenance, and the indexer stored it: a re-indexed copy reported the original's `goodmem_memory_id` (so `delete_memory` with it deleted the original), and a stored `goodmem_partial: false` hid a real `RERANKING_FAILED` | Provenance written last and `goodmem_*` stripped from memory metadata and by the indexer |
 
 ## Changes in 0.2.0
 
@@ -205,12 +237,13 @@ Reproduced against the published 0.1.2 package, live against GoodMem v1.0.320.
 | --- | --- | --- |
 | `tests/goodmem_test.ts` | 43 | nothing — the real SDK over a mocked `fetch`, fed NDJSON captured from a live server |
 | `tests/goodmem_ids_test.ts` | 56 | nothing — the real SDK over real HTTP to a local server that records every request; every id-taking entry point, fourteen malformed ids each |
-| `tests/goodmem_live_test.ts` | 15 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
+| `tests/goodmem_rerank_test.ts` | 17 | nothing — the same, with a server that rejects undeclared retrieve fields; the reranker request, failed-rerank fallback hits, `goodmem_*` provenance |
+| `tests/goodmem_live_test.ts` | 17 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
 npm install
 npm test          # offline
-npm run test:live # live; set GOODMEM_TEST_EMBEDDER_ID to pin an embedder
+npm run test:live # live; GOODMEM_TEST_EMBEDDER_ID pins an embedder, GOODMEM_TEST_RERANKER_ID enables the reranker test
 npx tsc --noEmit  # types, as CI runs them
 ```
 

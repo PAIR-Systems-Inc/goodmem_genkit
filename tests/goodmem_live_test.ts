@@ -97,7 +97,7 @@ describe('live', { skip }, () => {
 
   it('a configured reranker is applied, not rejected', async (t) => {
     if (!RERANKER) return t.skip('GOODMEM_TEST_RERANKER_ID is not set');
-    // 0.2.1 sent a top-level rerankerId and the server answered 400
+    // 0.2.0 sent a top-level rerankerId and the server answered 400
     // 'Unrecognized field "rerankerId"' on every retrieval.
     const ai = makeAi([spaceId], { rerankerId: RERANKER });
     const out = await tool(ai, 'search', { query: canary, topK: 3 });
@@ -114,7 +114,7 @@ describe('live', { skip }, () => {
 
   it('a reranker that fails keeps the vector hits, flagged', async () => {
     // A well-formed id that names no reranker: the server answers NOT_FOUND
-    // + RERANKING_FAILED and falls back to vector hits. 0.2.1 labelled those
+    // + RERANKING_FAILED and falls back to vector hits. 0.2.0 labelled those
     // 'reranker', left them unflipped, and a minScore then dropped them all.
     const ai = makeAi([spaceId], { rerankerId: '00000000-0000-4000-8000-000000000000', minScore: 0.5 });
     const out = await tool(ai, 'search', { query: canary, topK: 3 });

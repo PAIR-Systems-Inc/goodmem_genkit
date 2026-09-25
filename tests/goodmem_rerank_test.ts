@@ -4,7 +4,7 @@
  * These drive the real `@pairsystems/goodmem` SDK against a local server that
  * records every request and -- like GoodMem -- rejects a retrieve body that
  * carries a field `RetrieveMemoryRequest` does not declare, with the server's
- * own 400 wording. 0.2.1 sent `rerankerId` as a top-level field, which the SDK
+ * own 400 wording. 0.2.0 sent `rerankerId` as a top-level field, which the SDK
  * only translates in its `(message, options)` form; the object form goes out
  * verbatim, so every retrieval with a reranker configured failed.
  *
@@ -356,7 +356,7 @@ describe('goodmem_* provenance', () => {
   });
 
   it('a re-indexed copy reports its own ids, and deleting by them deletes the copy', async () => {
-    // What 0.2.1's indexer stored for a retrieved document: every goodmem_* key.
+    // What 0.2.0's indexer stored for a retrieved document: every goodmem_* key.
     const stored = {
       goodmem_chunk_id: ORIGINAL_CHUNK,
       goodmem_memory_id: ORIGINAL_ID,

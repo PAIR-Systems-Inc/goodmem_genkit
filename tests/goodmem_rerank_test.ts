@@ -333,3 +333,93 @@ describe('when the reranker fails', () => {
   });
 });
 
+// ---- (2) goodmem_* provenance describes this retrieval ------------------------
+
+/** A retrieve stream that returns the copy, carrying `metadata` as stored. */
+function copyStream(base: string, metadata: Record<string, unknown>): string {
+  return base
+    .replaceAll(ORIGINAL_ID, COPY_ID)
+    .replaceAll(ORIGINAL_CHUNK, COPY_CHUNK)
+    .replaceAll(SPACE_ID, COPY_SPACE)
+    .replace(FIXTURE_METADATA, `"metadata":${JSON.stringify(metadata)}`);
+}
+
+describe('goodmem_* provenance', () => {
+  it('the indexer does not store it', async () => {
+    const ai = plugin();
+    const docs = await ai.retrieve({ retriever: 'goodmem/memories', query: 'canary' });
+    assert.equal(docs[0].metadata?.goodmem_memory_id, ORIGINAL_ID);
+    await ai.index({ indexer: 'goodmem/memories', documents: docs });
+    const created = requests.filter((r) => r.method === 'POST' && r.url === '/v1/memories');
+    assert.equal(created.length, 1);
+    assert.deepEqual(JSON.parse(created[0].body).metadata, { year: 2026, active: true, tenant: 'acme' });
+  });
+
+  it('a re-indexed copy reports its own ids, and deleting by them deletes the copy', async () => {
+    // What 0.2.1's indexer stored for a retrieved document: every goodmem_* key.
+    const stored = {
+      goodmem_chunk_id: ORIGINAL_CHUNK,
+      goodmem_memory_id: ORIGINAL_ID,
+      goodmem_space_id: SPACE_ID,
+      goodmem_score: 0.58,
+      goodmem_raw_score: -0.58,
+      goodmem_score_kind: 'reranker',
+      goodmem_partial: false,
+      tenant: 'acme',
+    };
+    stream = copyStream(fixture('retrieve_ok.ndjson'), stored);
+    const ai = plugin({ spaceIds: [COPY_SPACE], allowDelete: true });
+    const [doc] = await ai.retrieve({ retriever: 'goodmem/memories', query: 'canary' });
+    const md = doc.metadata ?? {};
+    assert.equal(md.goodmem_memory_id, COPY_ID);
+    assert.equal(md.goodmem_space_id, COPY_SPACE);
+    assert.equal(md.goodmem_chunk_id, COPY_CHUNK);
+    assert.equal(md.goodmem_raw_score, -0.5845972299575806);
+    assert.equal(md.goodmem_score_kind, 'vector');
+    assert.equal(md.tenant, 'acme', "the memory's own metadata is still carried");
+
+    requests = [];
+    await callTool(ai, 'delete_memory', { memoryId: md.goodmem_memory_id });
+    assert.deepEqual(
+      requests.map((r) => `${r.method} ${r.url}`),
+      [`DELETE /v1/memories/${COPY_ID}`]
+    );
+  });
+
+  it('a stored goodmem_partial cannot mask a degraded retrieval', async () => {
+    stream = copyStream(DEGRADED(), { goodmem_partial: false, goodmem_statuses: [], tenant: 'acme' });
+    const [doc] = await plugin({ spaceIds: [COPY_SPACE] }).retrieve({
+      retriever: 'goodmem/memories',
+      query: 'canary',
+    });
+    assert.equal(doc.metadata?.goodmem_partial, true);
+    assert.deepEqual(
+      (doc.metadata?.goodmem_statuses as any[]).map((s) => s.code),
+      ['NOT_FOUND', 'RERANKING_FAILED']
+    );
+  });
+
+  it('a stored goodmem_statuses cannot make a clean retrieval look degraded', async () => {
+    stream = copyStream(fixture('retrieve_ok.ndjson'), {
+      goodmem_partial: true,
+      goodmem_statuses: [{ code: 'EMBEDDER_FAILED', message: 'spoofed' }],
+    });
+    const [doc] = await plugin({ spaceIds: [COPY_SPACE] }).retrieve({
+      retriever: 'goodmem/memories',
+      query: 'canary',
+    });
+    assert.equal(doc.metadata?.goodmem_partial, false);
+    assert.ok(!('goodmem_statuses' in (doc.metadata ?? {})));
+  });
+
+  it('the indexer strips goodmem_* from any document, keeping the rest', async () => {
+    await plugin().index({
+      indexer: 'goodmem/memories',
+      documents: [
+        Document.fromText('note', { goodmem_memory_id: ORIGINAL_ID, goodmem_partial: false, source: 'wiki' }),
+      ],
+    });
+    const created = requests.filter((r) => r.method === 'POST' && r.url === '/v1/memories');
+    assert.deepEqual(JSON.parse(created[0].body).metadata, { source: 'wiki' });
+  });
+});

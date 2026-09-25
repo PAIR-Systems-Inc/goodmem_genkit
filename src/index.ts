@@ -408,9 +408,29 @@ export class GoodMemConnection {
   }
 }
 
-/** Turn a hit into a Genkit Document, carrying its ids, score and metadata. */
+/** Document metadata keys starting with this are written by the plugin. */
+const PROVENANCE_PREFIX = 'goodmem_';
+
+/** A copy of `metadata` without any key the plugin reserves for provenance. */
+function withoutProvenance(metadata: Record<string, unknown> | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata ?? {})) {
+    if (!key.startsWith(PROVENANCE_PREFIX)) out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Turn a hit into a Genkit Document, carrying its ids, score and metadata.
+ *
+ * The memory's own metadata goes in first, without any `goodmem_*` key, and
+ * the provenance last: a document retrieved and indexed elsewhere (a copy, a
+ * cache, a migration) must not report the original's ids, and a stored
+ * `goodmem_partial: false` must not mask a degraded retrieval.
+ */
 export function hitToDocument(hit: RetrievalHit, outcome: RetrievalOutcome): Document {
   return Document.fromText(hit.text, {
+    ...withoutProvenance(hit.metadata),
     goodmem_chunk_id: hit.chunkId,
     goodmem_memory_id: hit.memoryId,
     goodmem_space_id: hit.spaceId,
@@ -419,7 +439,6 @@ export function hitToDocument(hit: RetrievalHit, outcome: RetrievalOutcome): Doc
     goodmem_score_kind: hit.scoreKind,
     goodmem_partial: outcome.partial,
     ...(outcome.partial ? { goodmem_statuses: outcome.statuses } : {}),
-    ...hit.metadata,
   });
 }
 
@@ -497,9 +516,12 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
     );
 
     // ---- native indexer --------------------------------------------------
+    // goodmem_* keys describe one retrieval of one memory; stored on a new
+    // memory they would name the original's ids. They are dropped.
     ai.defineIndexer({ name: 'goodmem/memories' }, async (docs) => {
       for (const doc of docs) {
-        await conn.createFromText(doc.text, doc.metadata);
+        const metadata = withoutProvenance(doc.metadata);
+        await conn.createFromText(doc.text, Object.keys(metadata).length ? metadata : undefined);
       }
     });
 

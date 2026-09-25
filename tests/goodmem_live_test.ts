@@ -112,6 +112,22 @@ describe('live', { skip }, () => {
     assert.equal(docs[0].metadata?.goodmem_score_kind, 'reranker');
   });
 
+  it('a reranker that fails keeps the vector hits, flagged', async () => {
+    // A well-formed id that names no reranker: the server answers NOT_FOUND
+    // + RERANKING_FAILED and falls back to vector hits. 0.2.1 labelled those
+    // 'reranker', left them unflipped, and a minScore then dropped them all.
+    const ai = makeAi([spaceId], { rerankerId: '00000000-0000-4000-8000-000000000000', minScore: 0.5 });
+    const out = await tool(ai, 'search', { query: canary, topK: 3 });
+    assert.equal(out.partial, true);
+    const codes = out.statuses.map((s: any) => s.code);
+    assert.ok(codes.includes('RERANKING_FAILED') || codes.includes('NOT_FOUND'), JSON.stringify(codes));
+    assert.ok(out.results.some((r: any) => r.text.includes(canary)), 'the fallback hits were discarded');
+    for (const hit of out.results) {
+      assert.equal(hit.scoreKind, 'vector');
+      assert.ok(hit.rawScore < 0 && hit.score > 0, 'a vector score was not flipped');
+    }
+  });
+
   it('the native retriever returns Genkit documents', async () => {
     const ai = makeAi([spaceId]);
     const docs = await ai.retrieve({ retriever: 'goodmem/memories', query: canary, options: { k: 3 } });

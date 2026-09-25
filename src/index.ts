@@ -171,12 +171,15 @@ export class GoodMemConnection {
     let outcome: RetrievalOutcome;
     try {
       const events = this.client.memories.retrieve(request as any);
-      outcome = await outcomeFromEvents(events, Boolean(this.rerankerId));
+      outcome = await outcomeFromEvents(events, this.rerankerId != null);
     } catch (error: any) {
       throw wrapError(error, 'Retrieval');
     }
 
-    if (this.minScore !== undefined && this.rerankerId) {
+    // Only reranker scores meet the threshold. When the reranker failed, the
+    // server's fallback hits are vector scores on another scale, and they
+    // are kept (flagged partial) rather than discarded.
+    if (this.minScore !== undefined && outcome.reranked) {
       const kept = outcome.hits.filter((h) => h.score !== null && h.score >= this.minScore!);
       if (outcome.hits.length > 0 && kept.length === 0) {
         const scores = outcome.hits.map((h) => h.score).filter((s): s is number => s !== null);

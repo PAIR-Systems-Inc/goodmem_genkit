@@ -265,3 +265,71 @@ describe('a configured reranker', () => {
   });
 });
 
+// ---- (3) reranked is read from the response, not the configuration ------------
+
+describe('when the reranker fails', () => {
+  it('fallback hits are vector hits: flipped and labelled vector', async () => {
+    stream = DEGRADED();
+    const outcome = await connection({ rerankerId: RERANKER_ID }).retrieve('canary', 3);
+    assert.equal(outcome.partial, true);
+    assert.deepEqual(
+      outcome.hits.map((h) => [h.scoreKind, h.rawScore, h.score]),
+      [['vector', -0.5845972299575806, 0.5845972299575806]]
+    );
+  });
+
+  it('a reranker minScore does not discard them (Q4a)', async () => {
+    for (const minScore of [0, 0.5, 0.99]) {
+      stream = DEGRADED();
+      const outcome = await connection({ rerankerId: RERANKER_ID, minScore }).retrieve('canary', 3);
+      assert.equal(outcome.hits.length, 1, `minScore ${minScore} discarded the server's hit`);
+      assert.equal(outcome.partial, true);
+      assert.ok(outcome.statuses.some((s) => s.code === 'RERANKING_FAILED'));
+    }
+  });
+
+  it('a reranker NOT_FOUND alone is enough', async () => {
+    stream = NOT_FOUND_ONLY();
+    const outcome = await connection({ rerankerId: RERANKER_ID, minScore: 0.5 }).retrieve('canary', 3);
+    assert.deepEqual(outcome.statuses.map((s) => s.code), ['NOT_FOUND']);
+    assert.deepEqual(outcome.hits.map((h) => [h.scoreKind, h.score]), [['vector', 0.5845972299575806]]);
+  });
+
+  it('a failure reported after the hits still applies to them', async () => {
+    const lines = DEGRADED().trim().split('\n');
+    const statuses = lines.filter((l) => l.startsWith('{"status"'));
+    stream = [...lines.filter((l) => !l.startsWith('{"status"')), ...statuses].join('\n') + '\n';
+    const outcome = await connection({ rerankerId: RERANKER_ID, minScore: 0.9 }).retrieve('canary', 3);
+    assert.deepEqual(outcome.hits.map((h) => [h.scoreKind, h.score]), [['vector', 0.5845972299575806]]);
+  });
+
+  it('a NOT_FOUND about something else does not unlabel a real rerank', async () => {
+    const other = line({
+      status: {
+        code: 'NOT_FOUND',
+        message: 'Space not found: 01a0d44b-96ae-7081-bc16-5644e701222a',
+        details: { space_id: '01a0d44b-96ae-7081-bc16-5644e701222a' },
+      },
+    });
+    stream = other + rerankedStream([0.93]);
+    const outcome = await connection({ rerankerId: RERANKER_ID }).retrieve('canary', 3);
+    assert.equal(outcome.partial, true);
+    assert.deepEqual(outcome.hits.map((h) => [h.scoreKind, h.score]), [['reranker', 0.93]]);
+  });
+
+  it('the retriever and the tool agree', async () => {
+    const ai = plugin({ rerankerId: RERANKER_ID, minScore: 0.9 });
+    stream = DEGRADED();
+    const docs = await ai.retrieve({ retriever: 'goodmem/memories', query: 'canary' });
+    assert.equal(docs.length, 1);
+    assert.equal(docs[0].metadata?.goodmem_score_kind, 'vector');
+    assert.equal(docs[0].metadata?.goodmem_score, 0.5845972299575806);
+    assert.equal(docs[0].metadata?.goodmem_partial, true);
+
+    stream = DEGRADED();
+    const out = await callTool(ai, 'search', { query: 'canary', topK: 5 });
+    assert.equal(out.results[0].scoreKind, 'vector');
+    assert.equal(out.results[0].score, 0.5845972299575806);
+  });
+});
+

@@ -5,7 +5,7 @@
  * which is also the check that no credential is baked into the package.
  *
  *   GOODMEM_API_KEY=... GOODMEM_BASE_URL=https://localhost:8080 \
- *     GOODMEM_TEST_EMBEDDER_ID=... npm run test:live
+ *     GOODMEM_TEST_EMBEDDER_ID=... GOODMEM_TEST_RERANKER_ID=... npm run test:live
  */
 
 import assert from 'node:assert/strict';
@@ -22,6 +22,7 @@ const BASE = process.env.GOODMEM_BASE_URL;
 const KEY = process.env.GOODMEM_API_KEY;
 const EMBEDDER = process.env.GOODMEM_TEST_EMBEDDER_ID;
 const FAILING_EMBEDDER = process.env.GOODMEM_TEST_FAILING_EMBEDDER_ID;
+const RERANKER = process.env.GOODMEM_TEST_RERANKER_ID;
 const skip = !(BASE && KEY) ? 'GOODMEM_API_KEY and GOODMEM_BASE_URL are not set' : false;
 
 if (!skip && process.env.GOODMEM_VERIFY_SSL !== 'true') {
@@ -92,6 +93,23 @@ describe('live', { skip }, () => {
     assert.equal(hit.scoreKind, 'vector');
     assert.equal((hit.metadata as any).tenant, 'acme');
     assert.ok(hit.chunkId && hit.memoryId && hit.spaceId);
+  });
+
+  it('a configured reranker is applied, not rejected', async (t) => {
+    if (!RERANKER) return t.skip('GOODMEM_TEST_RERANKER_ID is not set');
+    // 0.2.1 sent a top-level rerankerId and the server answered 400
+    // 'Unrecognized field "rerankerId"' on every retrieval.
+    const ai = makeAi([spaceId], { rerankerId: RERANKER });
+    const out = await tool(ai, 'search', { query: canary, topK: 3 });
+    assert.equal(out.partial, false, JSON.stringify(out.statuses));
+    assert.ok(out.results.some((r: any) => r.text.includes(canary)));
+    for (const hit of out.results) {
+      assert.equal(hit.scoreKind, 'reranker');
+      assert.equal(hit.score, hit.rawScore, 'a reranker score was flipped');
+    }
+    const docs = await ai.retrieve({ retriever: 'goodmem/memories', query: canary, options: { k: 3 } });
+    assert.ok(docs.length >= 1);
+    assert.equal(docs[0].metadata?.goodmem_score_kind, 'reranker');
   });
 
   it('the native retriever returns Genkit documents', async () => {

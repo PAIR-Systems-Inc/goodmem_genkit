@@ -31,6 +31,8 @@ export type { RetrievalHit, RetrievalOutcome, RetrievalStatus };
 /** Upper bound on items a single listing will pull. */
 const DEFAULT_MAX_LIST_ITEMS = 200;
 const DEFAULT_TIMEOUT_MS = 30_000;
+/** The server-side post-processor that applies a reranker (and an LLM). */
+const CHAT_POST_PROCESSOR = 'com.goodmem.retrieval.postprocess.ChatPostProcessorFactory';
 
 /** Configuration for the GoodMem plugin. */
 export interface GoodMemPluginParams {
@@ -154,7 +156,17 @@ export class GoodMemConnection {
       fetchMemory: true,
     };
     // Present means used: an empty rerankerId is refused, not read as unset.
-    if (this.rerankerId != null) request.rerankerId = requireUuid(this.rerankerId, 'rerankerId');
+    // The SDK translates a flat `rerankerId` only in its (message, options)
+    // form; this object form is sent verbatim, and the server rejects a
+    // top-level `rerankerId` with 400 "Unrecognized field". So the
+    // post-processor is built here, as the SDK itself would build it, which
+    // also keeps the per-space filters in spaceKeys.
+    if (this.rerankerId != null) {
+      request.postProcessor = {
+        name: CHAT_POST_PROCESSOR,
+        config: { reranker_id: requireUuid(this.rerankerId, 'rerankerId') },
+      };
+    }
 
     let outcome: RetrievalOutcome;
     try {

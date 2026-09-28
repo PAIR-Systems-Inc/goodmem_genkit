@@ -87,6 +87,12 @@ export interface RetrievalOutcome {
    * Independent of whether hits came back.
    */
   partial: boolean;
+  /**
+   * True when the hits carry reranker scores: a reranker was requested *and*
+   * the server did not report that it failed. Read from the response, never
+   * from configuration alone -- a failed reranker still returns vector hits.
+   */
+  reranked: boolean;
   resultSetId: string;
   abstractReply?: string;
 }
@@ -128,6 +134,23 @@ export function orientScore(raw: number | null | undefined, reranked: boolean): 
   return reranked ? raw : -raw;
 }
 
+/**
+ * Whether the server reported that the requested reranker was not applied.
+ *
+ * On `RERANKING_FAILED`, or a `NOT_FOUND` naming the reranker, GoodMem still
+ * returns the vector-scored hits it had before reranking. Those scores are
+ * negative distances, so they must be oriented as vector scores and must not
+ * meet a reranker threshold -- which would discard every one of them.
+ */
+export function rerankerFailed(statuses: RetrievalStatus[]): boolean {
+  return statuses.some(
+    (s) =>
+      s.code === 'RERANKING_FAILED' ||
+      (s.code === 'NOT_FOUND' &&
+        (s.details?.reranker_id !== undefined || /reranker/i.test(s.message)))
+  );
+}
+
 /** A one-line summary of why a retrieval was degraded. */
 export function warningText(statuses: RetrievalStatus[]): string {
   if (statuses.length === 0) return '';
@@ -153,12 +176,13 @@ function asRecord(value: unknown): Record<string, unknown> {
  */
 export async function outcomeFromEvents(
   events: AsyncIterable<any>,
-  reranked = false
+  rerankRequested = false
 ): Promise<RetrievalOutcome> {
   const outcome: RetrievalOutcome = {
     hits: [],
     statuses: [],
     partial: false,
+    reranked: false,
     resultSetId: '',
   };
   const memories = new Map<string, Record<string, unknown>>();
@@ -211,8 +235,9 @@ export async function outcomeFromEvents(
           memoryId,
           spaceId: '',
           rawScore: rawScore === null ? null : Number(rawScore),
-          score: orientScore(rawScore === null ? null : Number(rawScore), reranked),
-          scoreKind: reranked ? 'reranker' : 'vector',
+          // Oriented below, once every status has arrived.
+          score: null,
+          scoreKind: 'vector',
           contentType: '',
           metadata: {},
         },
@@ -233,7 +258,12 @@ export async function outcomeFromEvents(
     outcome.partial = true;
   }
 
+  // A status can arrive after the hits it concerns, so what kind of score the
+  // hits carry is decided only once the stream is done.
+  outcome.reranked = rerankRequested && !rerankerFailed(outcome.statuses);
   for (const { hit, memoryId } of pending) {
+    hit.score = orientScore(hit.rawScore, outcome.reranked);
+    hit.scoreKind = outcome.reranked ? 'reranker' : 'vector';
     const mem = memories.get(memoryId);
     if (mem) {
       hit.spaceId = String(mem.spaceId ?? '');

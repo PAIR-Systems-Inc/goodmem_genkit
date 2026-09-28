@@ -26,13 +26,15 @@ import {
   orientScore,
 } from '../src/results.js';
 import { GoodMemUploadError, resolveUploadPath } from '../src/uploads.js';
-import { decodeContent, goodmem } from '../src/index.js';
+import { requireUuid } from '../src/ids.js';
+import { decodeContent, GoodMemError, goodmem } from '../src/index.js';
 
 const FIXTURES = join(import.meta.dirname ?? __dirname, 'goodmem_fixtures');
 const fixture = (name: string) => readFileSync(join(FIXTURES, name));
 
 const BASE = 'https://goodmem.test';
 const KEY = 'gm_offline_test_key';
+const SPACE_ID = '01a0d44b-746f-775b-b91e-bc73d4058e27';
 
 let originalFetch: typeof globalThis.fetch;
 beforeEach(() => {
@@ -60,7 +62,7 @@ function serveRetrieve(payload: Buffer, capture?: { body?: any }) {
 function makeAi(overrides: Record<string, unknown> = {}) {
   return genkit({
     plugins: [
-      goodmem({ baseUrl: BASE, apiKey: KEY, spaceIds: ['space-1'], ...overrides } as any),
+      goodmem({ baseUrl: BASE, apiKey: KEY, spaceIds: [SPACE_ID], ...overrides } as any),
     ],
   });
 }
@@ -314,6 +316,26 @@ describe('uploads', () => {
 
   it('is disabled entirely without an uploadDir', () => {
     assert.throws(() => resolveUploadPath('/etc/hostname', undefined), /disabled/);
+  });
+});
+
+describe('ids', () => {
+  it('accepts a canonical UUID and returns it lower-cased', () => {
+    assert.equal(requireUuid(SPACE_ID.toUpperCase(), 'spaceId'), SPACE_ID);
+  });
+
+  it('refuses anything else with a GoodMemError naming the field', () => {
+    for (const bad of [`../spaces/${SPACE_ID}`, `${SPACE_ID} `, `${SPACE_ID}\n`, '', 'space-1', undefined, null, 42]) {
+      assert.throws(() => requireUuid(bad, 'memoryId'), (err: any) => {
+        assert.ok(err instanceof GoodMemError, 'not a GoodMemError');
+        assert.match(err.message, /^memoryId must be a UUID/);
+        return true;
+      });
+    }
+  });
+
+  it('bounds how much of a refused value it repeats', () => {
+    assert.throws(() => requireUuid('x'.repeat(10_000), 'spaceId'), (err: any) => err.message.length < 400);
   });
 });
 

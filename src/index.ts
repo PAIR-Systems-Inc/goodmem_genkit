@@ -10,8 +10,10 @@ import { Document, Genkit, z } from 'genkit';
 import { genkitPlugin, type GenkitPlugin } from 'genkit/plugin';
 import { Goodmem } from '@pairsystems/goodmem';
 
+import { GoodMemError } from './errors.js';
 import * as filters from './filters.js';
 import { fromMapping } from './filters.js';
+import { requireUuid } from './ids.js';
 import {
   MALFORMED_STREAM_CODE,
   UNKNOWN_CODE,
@@ -23,12 +25,14 @@ import {
 } from './results.js';
 import { GoodMemUploadError, resolveUploadPath } from './uploads.js';
 
-export { filters, GoodMemUploadError, MALFORMED_STREAM_CODE, UNKNOWN_CODE };
+export { filters, GoodMemError, GoodMemUploadError, MALFORMED_STREAM_CODE, UNKNOWN_CODE };
 export type { RetrievalHit, RetrievalOutcome, RetrievalStatus };
 
 /** Upper bound on items a single listing will pull. */
 const DEFAULT_MAX_LIST_ITEMS = 200;
 const DEFAULT_TIMEOUT_MS = 30_000;
+/** The server-side post-processor that applies a reranker (and an LLM). */
+const CHAT_POST_PROCESSOR = 'com.goodmem.retrieval.postprocess.ChatPostProcessorFactory';
 
 /** Configuration for the GoodMem plugin. */
 export interface GoodMemPluginParams {
@@ -37,8 +41,8 @@ export interface GoodMemPluginParams {
   /** The GoodMem API key. */
   apiKey: string;
   /**
-   * The spaces this plugin reads from and writes to. A model never chooses
-   * a space; retrieval and writes are scoped here.
+   * The spaces this plugin reads from and writes to, as UUIDs. A model never
+   * chooses a space; retrieval and writes are scoped here.
    */
   spaceIds: string[];
   /** Per-request timeout in milliseconds. Defaults to 30s. */
@@ -48,7 +52,7 @@ export interface GoodMemPluginParams {
    * tool is registered and no path is ever read from disk.
    */
   uploadDir?: string;
-  /** A reranker applied to retrieval. */
+  /** A reranker applied to retrieval, as a UUID. */
   rerankerId?: string;
   /**
    * Drop hits scoring below this value. Applies only with `rerankerId` set,
@@ -65,18 +69,6 @@ export interface GoodMemPluginParams {
   allowDelete?: boolean;
   /** Upper bound on items returned by a listing. */
   maxListItems?: number;
-}
-
-/** Raised when a GoodMem operation fails, carrying the server's own message. */
-export class GoodMemError extends Error {
-  readonly statusCode?: number;
-  readonly body?: string;
-  constructor(message: string, statusCode?: number, body?: string) {
-    super(message);
-    this.name = 'GoodMemError';
-    this.statusCode = statusCode;
-    this.body = body;
-  }
 }
 
 function wrapError(error: any, what: string): GoodMemError {
@@ -144,9 +136,15 @@ export class GoodMemConnection {
 
   private spaceKeys(): Array<Record<string, unknown>> {
     const expression = fromMapping(this.metadataFilter);
-    return this.spaceIds.map((spaceId) =>
-      expression ? { spaceId, filter: expression } : { spaceId }
-    );
+    return this.spaceIds.map((id, i) => {
+      const spaceId = requireUuid(id, `spaceIds[${i}]`);
+      return expression ? { spaceId, filter: expression } : { spaceId };
+    });
+  }
+
+  /** The configured space that writes and default listings go to. */
+  private defaultSpaceId(): string {
+    return requireUuid(this.spaceIds[0], 'spaceIds[0]');
   }
 
   /** Run one retrieval and fold the stream into an outcome. */
@@ -157,17 +155,31 @@ export class GoodMemConnection {
       requestedSize: topK,
       fetchMemory: true,
     };
-    if (this.rerankerId) request.rerankerId = this.rerankerId;
+    // Present means used: an empty rerankerId is refused, not read as unset.
+    // The SDK translates a flat `rerankerId` only in its (message, options)
+    // form; this object form is sent verbatim, and the server rejects a
+    // top-level `rerankerId` with 400 "Unrecognized field". So the
+    // post-processor is built here, as the SDK itself would build it, which
+    // also keeps the per-space filters in spaceKeys.
+    if (this.rerankerId != null) {
+      request.postProcessor = {
+        name: CHAT_POST_PROCESSOR,
+        config: { reranker_id: requireUuid(this.rerankerId, 'rerankerId') },
+      };
+    }
 
     let outcome: RetrievalOutcome;
     try {
       const events = this.client.memories.retrieve(request as any);
-      outcome = await outcomeFromEvents(events, Boolean(this.rerankerId));
+      outcome = await outcomeFromEvents(events, this.rerankerId != null);
     } catch (error: any) {
       throw wrapError(error, 'Retrieval');
     }
 
-    if (this.minScore !== undefined && this.rerankerId) {
+    // Only reranker scores meet the threshold. When the reranker failed, the
+    // server's fallback hits are vector scores on another scale, and they
+    // are kept (flagged partial) rather than discarded.
+    if (this.minScore !== undefined && outcome.reranked) {
       const kept = outcome.hits.filter((h) => h.score !== null && h.score >= this.minScore!);
       if (outcome.hits.length > 0 && kept.length === 0) {
         const scores = outcome.hits.map((h) => h.score).filter((s): s is number => s !== null);
@@ -184,9 +196,10 @@ export class GoodMemConnection {
   }
 
   async createFromText(text: string, metadata?: Record<string, unknown>) {
+    const spaceId = this.defaultSpaceId();
     try {
       return await this.client.memories.create({
-        spaceId: this.spaceIds[0],
+        spaceId,
         originalContent: text,
         contentType: 'text/plain',
         ...(metadata ? { metadata } : {}),
@@ -197,11 +210,12 @@ export class GoodMemConnection {
   }
 
   async createFromFile(fileName: string, metadata?: Record<string, unknown>) {
+    const spaceId = this.defaultSpaceId();
     const resolved = resolveUploadPath(fileName, this.uploadDir);
     try {
       return await (this.client.memories as any).createFromPath({
         path: resolved,
-        spaceId: this.spaceIds[0],
+        spaceId,
         ...(metadata ? { metadata } : {}),
       });
     } catch (error: any) {
@@ -211,19 +225,20 @@ export class GoodMemConnection {
   }
 
   async getMemory(memoryId: string, includeContent: boolean) {
+    const id = requireUuid(memoryId, 'memoryId');
     let memory: any;
     try {
-      memory = await this.client.memories.get(memoryId);
+      memory = await this.client.memories.get(id);
     } catch (error: any) {
-      throw wrapError(error, `Fetching memory ${memoryId}`);
+      throw wrapError(error, `Fetching memory ${id}`);
     }
     const result: Record<string, unknown> = { success: true, memory };
     if (includeContent) {
       let raw: Uint8Array;
       try {
-        raw = await this.client.memories.content(memoryId);
+        raw = await this.client.memories.content(id);
       } catch (error: any) {
-        throw wrapError(error, `Fetching content of memory ${memoryId}`);
+        throw wrapError(error, `Fetching content of memory ${id}`);
       }
       const decoded = decodeContent(raw, String(memory?.contentType ?? ''));
       result.content = decoded.content;
@@ -250,7 +265,8 @@ export class GoodMemConnection {
   }
 
   async listMemories(spaceId?: string) {
-    const target = spaceId ?? this.spaceIds[0];
+    // The space id is a path segment here: /v1/spaces/{id}/memories.
+    const target = spaceId == null ? this.defaultSpaceId() : requireUuid(spaceId, 'spaceId');
     const out: any[] = [];
     try {
       for await (const memory of await this.client.memories.list(target, {} as any)) {
@@ -292,6 +308,8 @@ export class GoodMemConnection {
    * silently writes vectors from a different model than the caller asked for.
    */
   async createSpace(name: string, embedderId: string) {
+    // Checked before the listing below, so a refused id sends nothing at all.
+    embedderId = requireUuid(embedderId, 'embedderId');
     const existing = (await this.listSpaces()).filter((s) => s.name === name);
     if (existing.length > 1) {
       throw new GoodMemError(
@@ -336,6 +354,7 @@ export class GoodMemConnection {
     spaceId: string,
     opts: { name?: string; labels?: Record<string, string>; replaceLabels?: boolean }
   ) {
+    spaceId = requireUuid(spaceId, 'spaceId');
     const request: Record<string, unknown> = {};
     if (opts.name !== undefined) request.name = opts.name;
     if (opts.labels !== undefined) {
@@ -353,6 +372,7 @@ export class GoodMemConnection {
   }
 
   async getSpace(spaceId: string) {
+    spaceId = requireUuid(spaceId, 'spaceId');
     try {
       const space: any = await this.client.spaces.get(spaceId);
       return {
@@ -368,6 +388,7 @@ export class GoodMemConnection {
   }
 
   async deleteSpace(spaceId: string) {
+    spaceId = requireUuid(spaceId, 'spaceId');
     try {
       await this.client.spaces.delete(spaceId);
       return { success: true, spaceId };
@@ -377,6 +398,7 @@ export class GoodMemConnection {
   }
 
   async deleteMemory(memoryId: string) {
+    memoryId = requireUuid(memoryId, 'memoryId');
     try {
       await this.client.memories.delete(memoryId);
       return { success: true, memoryId };
@@ -386,9 +408,29 @@ export class GoodMemConnection {
   }
 }
 
-/** Turn a hit into a Genkit Document, carrying its ids, score and metadata. */
+/** Document metadata keys starting with this are written by the plugin. */
+const PROVENANCE_PREFIX = 'goodmem_';
+
+/** A copy of `metadata` without any key the plugin reserves for provenance. */
+function withoutProvenance(metadata: Record<string, unknown> | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata ?? {})) {
+    if (!key.startsWith(PROVENANCE_PREFIX)) out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Turn a hit into a Genkit Document, carrying its ids, score and metadata.
+ *
+ * The memory's own metadata goes in first, without any `goodmem_*` key, and
+ * the provenance last: a document retrieved and indexed elsewhere (a copy, a
+ * cache, a migration) must not report the original's ids, and a stored
+ * `goodmem_partial: false` must not mask a degraded retrieval.
+ */
 export function hitToDocument(hit: RetrievalHit, outcome: RetrievalOutcome): Document {
   return Document.fromText(hit.text, {
+    ...withoutProvenance(hit.metadata),
     goodmem_chunk_id: hit.chunkId,
     goodmem_memory_id: hit.memoryId,
     goodmem_space_id: hit.spaceId,
@@ -397,7 +439,6 @@ export function hitToDocument(hit: RetrievalHit, outcome: RetrievalOutcome): Doc
     goodmem_score_kind: hit.scoreKind,
     goodmem_partial: outcome.partial,
     ...(outcome.partial ? { goodmem_statuses: outcome.statuses } : {}),
-    ...hit.metadata,
   });
 }
 
@@ -413,6 +454,14 @@ const SearchInputSchema = z.object({
 const RememberInputSchema = z.object({
   text: z.string().describe('The text to remember.'),
 });
+
+/**
+ * A GoodMem id as the model sees it: declared as a UUID so the model is told.
+ * The check that actually guards the request is `requireUuid` at the call.
+ */
+function idArg(description: string) {
+  return z.string().uuid().describe(description);
+}
 
 const UploadInputSchema = z.object({
   fileName: z
@@ -443,6 +492,10 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
         'The model never chooses a space.'
     );
   }
+  // Configured ids fail here, at startup, as well as at every call that
+  // sends one.
+  params.spaceIds.forEach((id, i) => requireUuid(id, `spaceIds[${i}]`));
+  if (params.rerankerId != null) requireUuid(params.rerankerId, 'rerankerId');
 
   return genkitPlugin('goodmem', async (ai: Genkit) => {
     const conn = new GoodMemConnection(params);
@@ -463,9 +516,12 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
     );
 
     // ---- native indexer --------------------------------------------------
+    // goodmem_* keys describe one retrieval of one memory; stored on a new
+    // memory they would name the original's ids. They are dropped.
     ai.defineIndexer({ name: 'goodmem/memories' }, async (docs) => {
       for (const doc of docs) {
-        await conn.createFromText(doc.text, doc.metadata);
+        const metadata = withoutProvenance(doc.metadata);
+        await conn.createFromText(doc.text, Object.keys(metadata).length ? metadata : undefined);
       }
     });
 
@@ -547,7 +603,7 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
         {
           name: 'goodmem/get_space',
           description: 'Fetch one GoodMem space by id.',
-          inputSchema: z.object({ spaceId: z.string() }),
+          inputSchema: z.object({ spaceId: idArg('The id of the space, a UUID.') }),
         },
         async ({ spaceId }) => conn.getSpace(spaceId)
       );
@@ -555,7 +611,10 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
         {
           name: 'goodmem/create_space',
           description: 'Create a GoodMem space, or reuse one whose embedder matches.',
-          inputSchema: z.object({ name: z.string(), embedderId: z.string() }),
+          inputSchema: z.object({
+            name: z.string(),
+            embedderId: idArg('The id of the embedder that indexes the space, a UUID.'),
+          }),
         },
         async ({ name, embedderId }) => conn.createSpace(name, embedderId)
       );
@@ -564,7 +623,7 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
           name: 'goodmem/update_space',
           description: 'Rename a GoodMem space or edit its labels.',
           inputSchema: z.object({
-            spaceId: z.string(),
+            spaceId: idArg('The id of the space, a UUID.'),
             name: z.string().optional(),
             labels: z.record(z.string()).optional(),
             replaceLabels: z.boolean().optional(),
@@ -577,7 +636,9 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
         {
           name: 'goodmem/list_memories',
           description: 'List memories in a GoodMem space.',
-          inputSchema: z.object({ spaceId: z.string().optional() }),
+          inputSchema: z.object({
+            spaceId: idArg('The id of the space, a UUID. Defaults to the configured space.').optional(),
+          }),
         },
         async ({ spaceId }) => ({ success: true, memories: await conn.listMemories(spaceId) })
       );
@@ -586,7 +647,7 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
           name: 'goodmem/get_memory',
           description: 'Fetch a GoodMem memory by id, optionally with its content.',
           inputSchema: z.object({
-            memoryId: z.string(),
+            memoryId: idArg('The id of the memory, a UUID.'),
             includeContent: z.boolean().default(false),
           }),
         },
@@ -599,7 +660,7 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
         {
           name: 'goodmem/delete_memory',
           description: 'Permanently delete a GoodMem memory.',
-          inputSchema: z.object({ memoryId: z.string() }),
+          inputSchema: z.object({ memoryId: idArg('The id of the memory, a UUID.') }),
         },
         async ({ memoryId }) => conn.deleteMemory(memoryId)
       );
@@ -607,7 +668,7 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
         {
           name: 'goodmem/delete_space',
           description: 'Permanently delete a GoodMem space and every memory in it.',
-          inputSchema: z.object({ spaceId: z.string() }),
+          inputSchema: z.object({ spaceId: idArg('The id of the space, a UUID.') }),
         },
         async ({ spaceId }) => conn.deleteSpace(spaceId)
       );

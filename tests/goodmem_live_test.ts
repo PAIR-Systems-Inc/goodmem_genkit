@@ -5,7 +5,7 @@
  * which is also the check that no credential is baked into the package.
  *
  *   GOODMEM_API_KEY=... GOODMEM_BASE_URL=https://localhost:8080 \
- *     GOODMEM_TEST_EMBEDDER_ID=... npm run test:live
+ *     GOODMEM_TEST_EMBEDDER_ID=... GOODMEM_TEST_RERANKER_ID=... npm run test:live
  */
 
 import assert from 'node:assert/strict';
@@ -22,6 +22,7 @@ const BASE = process.env.GOODMEM_BASE_URL;
 const KEY = process.env.GOODMEM_API_KEY;
 const EMBEDDER = process.env.GOODMEM_TEST_EMBEDDER_ID;
 const FAILING_EMBEDDER = process.env.GOODMEM_TEST_FAILING_EMBEDDER_ID;
+const RERANKER = process.env.GOODMEM_TEST_RERANKER_ID;
 const skip = !(BASE && KEY) ? 'GOODMEM_API_KEY and GOODMEM_BASE_URL are not set' : false;
 
 if (!skip && process.env.GOODMEM_VERIFY_SSL !== 'true') {
@@ -92,6 +93,39 @@ describe('live', { skip }, () => {
     assert.equal(hit.scoreKind, 'vector');
     assert.equal((hit.metadata as any).tenant, 'acme');
     assert.ok(hit.chunkId && hit.memoryId && hit.spaceId);
+  });
+
+  it('a configured reranker is applied, not rejected', async (t) => {
+    if (!RERANKER) return t.skip('GOODMEM_TEST_RERANKER_ID is not set');
+    // 0.2.0 sent a top-level rerankerId and the server answered 400
+    // 'Unrecognized field "rerankerId"' on every retrieval.
+    const ai = makeAi([spaceId], { rerankerId: RERANKER });
+    const out = await tool(ai, 'search', { query: canary, topK: 3 });
+    assert.equal(out.partial, false, JSON.stringify(out.statuses));
+    assert.ok(out.results.some((r: any) => r.text.includes(canary)));
+    for (const hit of out.results) {
+      assert.equal(hit.scoreKind, 'reranker');
+      assert.equal(hit.score, hit.rawScore, 'a reranker score was flipped');
+    }
+    const docs = await ai.retrieve({ retriever: 'goodmem/memories', query: canary, options: { k: 3 } });
+    assert.ok(docs.length >= 1);
+    assert.equal(docs[0].metadata?.goodmem_score_kind, 'reranker');
+  });
+
+  it('a reranker that fails keeps the vector hits, flagged', async () => {
+    // A well-formed id that names no reranker: the server answers NOT_FOUND
+    // + RERANKING_FAILED and falls back to vector hits. 0.2.0 labelled those
+    // 'reranker', left them unflipped, and a minScore then dropped them all.
+    const ai = makeAi([spaceId], { rerankerId: '00000000-0000-4000-8000-000000000000', minScore: 0.5 });
+    const out = await tool(ai, 'search', { query: canary, topK: 3 });
+    assert.equal(out.partial, true);
+    const codes = out.statuses.map((s: any) => s.code);
+    assert.ok(codes.includes('RERANKING_FAILED') || codes.includes('NOT_FOUND'), JSON.stringify(codes));
+    assert.ok(out.results.some((r: any) => r.text.includes(canary)), 'the fallback hits were discarded');
+    for (const hit of out.results) {
+      assert.equal(hit.scoreKind, 'vector');
+      assert.ok(hit.rawScore < 0 && hit.score > 0, 'a vector score was not flipped');
+    }
   });
 
   it('the native retriever returns Genkit documents', async () => {
@@ -168,14 +202,25 @@ describe('live', { skip }, () => {
   });
 
   it("carries the server's own message on a rejected create", async () => {
-    await assert.rejects(
-      () => conn.createSpace(`gk-live-bad-${RUN}`, 'not-a-uuid'),
-      (err: any) => {
-        assert.equal(err.statusCode, 400);
-        assert.match(String(err.message).toLowerCase(), /embedder/);
-        return true;
-      }
-    );
+    // A well-formed id that names no embedder, so the server -- not the
+    // plugin's UUID check -- is what rejects it.
+    let error: any;
+    let created: any;
+    try {
+      created = await conn.createSpace(`gk-live-bad-${RUN}`, '00000000-0000-4000-8000-000000000000');
+    } catch (err) {
+      error = err;
+    }
+    if (created) await conn.deleteSpace(created.spaceId);
+    assert.ok(error, 'a space was created with an embedder that does not exist');
+    assert.ok(error.statusCode >= 400 && error.statusCode < 500, `HTTP ${error.statusCode}`);
+    assert.match(String(error.message).toLowerCase(), /embedder/);
+  });
+
+  it('refuses a malformed id without sending it', async () => {
+    await assert.rejects(() => conn.createSpace(`gk-live-bad-${RUN}`, 'not-a-uuid'), /embedderId must be a UUID/);
+    await assert.rejects(() => conn.deleteSpace(`../spaces/${spaceId}`), /spaceId must be a UUID/);
+    assert.equal((await conn.getSpace(spaceId)).spaceId, spaceId, 'the space is gone');
   });
 
   it('decodes text content as text', async () => {

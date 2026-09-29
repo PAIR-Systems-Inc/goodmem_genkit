@@ -5,7 +5,7 @@ a native retriever and indexer, plus agent tools. Documents are chunked,
 embedded and searched server-side; this plugin wraps the official
 `@pairsystems/goodmem` SDK.
 
-**Version 0.2.1.** Verified against GoodMem server **v1.0.320**.
+**Version 0.3.0.** Verified against GoodMem server **v1.0.320**.
 
 > **Upgrading from 0.1.2.** 0.1.2 talked to GoodMem over hand-written `fetch`.
 > Two defects stand out: `get_memory` with `includeContent` called `.json()`
@@ -22,6 +22,11 @@ embedded and searched server-side; this plugin wraps the official
 > 0.2.0 also failed **every** retrieval when `rerankerId` was set (HTTP 400
 > `Unrecognized field "rerankerId"`); 0.2.1 sends the reranker as a
 > post-processor. See [Changes in 0.2.1](#changes-in-021).
+
+> **New in 0.3.0.** An opt-in `llmId` has GoodMem write a grounded answer from
+> the retrieved chunks: `abstractReply` in `goodmem/search` output and
+> `goodmem_abstract_reply` on each retrieved document. Nothing changes unless
+> you set it. See [Grounded answers from an LLM](#grounded-answers-from-an-llm).
 
 ## Install
 
@@ -75,6 +80,7 @@ Each document carries the memory's own metadata plus its GoodMem provenance:
 | `goodmem_score_kind` | `'vector'` or `'reranker'` — not the same scale |
 | `goodmem_partial` | true when the server reported a problem |
 | `goodmem_statuses` | present when partial |
+| `goodmem_abstract_reply` | present when `llmId` is set and the LLM answered; the same answer on every document of one retrieval |
 
 The `goodmem_*` prefix is reserved. These keys always describe *this*
 retrieval: a memory's own metadata cannot override them, and the indexer
@@ -106,7 +112,7 @@ declared to the model as a UUID (`format: uuid`).
 
 ## Ids are UUIDs
 
-Every GoodMem id this plugin sends — a memory, space, embedder or reranker id,
+Every GoodMem id this plugin sends — a memory, space, embedder, reranker or LLM id,
 whether a model, your code or the plugin configuration supplied it — must be a
 canonical UUID; anything else is refused with a `GoodMemError` naming the
 field, before any request is made, because ids are part of the URL path
@@ -157,6 +163,52 @@ configuration. When the reranker fails the server reports `RERANKING_FAILED`
 had; those come back as `vector` scores, flipped, **not** filtered by
 `minScore`, with `partial` set and the statuses attached.
 
+## Grounded answers from an LLM
+
+GoodMem can run an LLM over the chunks a retrieval found and send back an
+answer grounded in them. It is **off** unless you set `llmId` — the id of an
+LLM registered in GoodMem, as a UUID. Like `rerankerId` it is set by you, the
+developer, never by the model: `goodmem/search` still takes only `query` and
+`topK`.
+
+```ts
+goodmem({
+  baseUrl: process.env.GOODMEM_BASE_URL!,
+  apiKey: process.env.GOODMEM_API_KEY!,
+  spaceIds: ['<space-uuid>'],
+  llmId: '<llm-uuid>',
+  rerankerId: '<reranker-uuid>', // optional; the two combine
+});
+```
+
+It is sent as `llm_id` in the retrieval's post-processor config, next to
+`reranker_id`. A value that is not a UUID — an LLM's display name, say — throws
+a `GoodMemError` when the plugin is created, and again at any call, before a
+request is made.
+
+Where the answer appears:
+
+| Path | Field |
+| --- | --- |
+| `goodmem/search` tool | `abstractReply` — a string, beside `results` |
+| `goodmem/memories` retriever | `goodmem_abstract_reply` in every document's metadata |
+| `GoodMemConnection.retrieve()` | `abstractReply` on the returned `RetrievalOutcome` |
+
+A Genkit retriever returns documents and nothing else, so the answer for the
+retrieval rides on each document, the same way `goodmem_partial` does; like
+every `goodmem_*` key, the indexer drops it. A retrieval that finds no
+documents has nothing to carry it: use `goodmem/search` or
+`GoodMemConnection.retrieve()` when you need the answer on its own.
+
+**When the LLM fails**, the server reports `SUMMARIZATION_FAILED` (with
+`NOT_FOUND` too when no LLM has that id; a provider error such as HTTP 429
+arrives in the message). That is a problem status like any other: the hits are
+kept, `partial` is set, the statuses and a `warning` are included, there is no
+`abstractReply`, and nothing is raised.
+
+An LLM does not rerank. Scores are labelled exactly as they would be without
+one — `vector` unless a reranker was applied — and `minScore` is unaffected.
+
 ## Metadata filters
 
 Filters are expressions evaluated server-side, not SQL. They are set by the
@@ -190,7 +242,19 @@ Uploads are **off** unless you set `uploadDir`. When set, every path is
 resolved (symlinks included) and refused if it lands outside that directory,
 so a model-supplied path cannot read arbitrary host files.
 
-## Changes in 0.2.1
+## Changes in 0.3.0
+
+A new, opt-in setting; nothing changes unless it is set. Measured with
+`tests/goodmem_llm_test.ts` and `tests/goodmem_ids_test.ts` against 0.2.1 and
+0.3.0, and live against a GoodMem server with an OpenRouter `qwen/qwen3-8b`
+LLM.
+
+| Was | Now |
+| --- | --- |
+| No way to ask GoodMem for an LLM answer: `llmId` was not a setting, so passing it did nothing — no `llm_id` reached the server and no answer came back | `llmId` is sent as `llm_id` in the post-processor config; the answer is `abstractReply` in `goodmem/search` output and `goodmem_abstract_reply` on retrieved documents |
+| `llmId: 'qwen3-8b'` (a name, not an id) was accepted silently | Refused with `llmId must be a UUID` at plugin creation and at every call; nothing sent |
+| A failing LLM could not be observed | `SUMMARIZATION_FAILED` / `NOT_FOUND` surface as `partial` + `statuses` + `warning`, with the hits kept |
+
 
 Measured by driving the real SDK against a local server that records every
 request it receives (`tests/goodmem_ids_test.ts` and
@@ -236,14 +300,15 @@ Reproduced against the published 0.1.2 package, live against GoodMem v1.0.320.
 | Suite | Count | Needs |
 | --- | --- | --- |
 | `tests/goodmem_test.ts` | 43 | nothing — the real SDK over a mocked `fetch`, fed NDJSON captured from a live server |
-| `tests/goodmem_ids_test.ts` | 56 | nothing — the real SDK over real HTTP to a local server that records every request; every id-taking entry point, fourteen malformed ids each |
+| `tests/goodmem_ids_test.ts` | 63 | nothing — the real SDK over real HTTP to a local server that records every request; every id-taking entry point, fourteen malformed ids each |
 | `tests/goodmem_rerank_test.ts` | 17 | nothing — the same, with a server that rejects undeclared retrieve fields; the reranker request, failed-rerank fallback hits, `goodmem_*` provenance |
-| `tests/goodmem_live_test.ts` | 17 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
+| `tests/goodmem_llm_test.ts` | 19 | nothing — the same, fed NDJSON captured live with an LLM configured, a nonexistent LLM, and a provider 429; the `llm_id` request, the abstract reply, `SUMMARIZATION_FAILED` |
+| `tests/goodmem_live_test.ts` | 20 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
 npm install
 npm test          # offline
-npm run test:live # live; GOODMEM_TEST_EMBEDDER_ID pins an embedder, GOODMEM_TEST_RERANKER_ID enables the reranker test
+npm run test:live # live; GOODMEM_TEST_EMBEDDER_ID pins an embedder, GOODMEM_TEST_RERANKER_ID and GOODMEM_TEST_LLM_ID enable the reranker and LLM tests
 npx tsc --noEmit  # types, as CI runs them
 ```
 

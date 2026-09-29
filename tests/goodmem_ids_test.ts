@@ -310,6 +310,13 @@ const CONFIGURED: Entry[] = [
     inBody: true,
   },
   {
+    name: 'config llmId -> GoodMemConnection.retrieve (request body)',
+    field: /llmId/,
+    call: (id) => connection({ llmId: id }).retrieve('q', 1),
+    expect: () => ['POST /v1/memories:retrieve'],
+    inBody: true,
+  },
+  {
     name: 'plugin spaceIds -> tool goodmem/search (request body)',
     field: /spaceIds\[0\]/,
     call: (id) => callTool(plugin({ spaceIds: [id] }), 'search', { query: 'q', topK: 1 }),
@@ -349,6 +356,20 @@ const CONFIGURED: Entry[] = [
     name: 'plugin rerankerId -> tool goodmem/search (request body)',
     field: /rerankerId/,
     call: (id) => callTool(plugin({ rerankerId: id }), 'search', { query: 'q', topK: 1 }),
+    expect: () => ['POST /v1/memories:retrieve'],
+    inBody: true,
+  },
+  {
+    name: 'plugin llmId -> tool goodmem/search (request body)',
+    field: /llmId/,
+    call: (id) => callTool(plugin({ llmId: id }), 'search', { query: 'q', topK: 1 }),
+    expect: () => ['POST /v1/memories:retrieve'],
+    inBody: true,
+  },
+  {
+    name: 'plugin llmId -> retriever goodmem/memories (request body)',
+    field: /llmId/,
+    call: (id) => plugin({ llmId: id }).retrieve({ retriever: 'goodmem/memories', query: 'q' }),
     expect: () => ['POST /v1/memories:retrieve'],
     inBody: true,
   },
@@ -510,9 +531,26 @@ describe('the plugin refuses a malformed configuration at startup', () => {
     assert.deepEqual(sent(), []);
   });
 
+  it('a non-UUID llmId, before any request', () => {
+    for (const payload of SHARED_PAYLOADS) {
+      assert.throws(
+        () => goodmem({ baseUrl, apiKey: KEY, spaceIds: [SPACE_ID], llmId: payload } as any),
+        /llmId.*UUID/,
+        JSON.stringify(payload)
+      );
+    }
+    assert.deepEqual(sent(), []);
+  });
+
   it('accepts UUIDs', () => {
     assert.doesNotThrow(() =>
-      goodmem({ baseUrl, apiKey: KEY, spaceIds: [SPACE_ID, U.toUpperCase()], rerankerId: EMBEDDER_ID })
+      goodmem({
+        baseUrl,
+        apiKey: KEY,
+        spaceIds: [SPACE_ID, U.toUpperCase()],
+        rerankerId: EMBEDDER_ID,
+        llmId: U.toUpperCase(),
+      } as any)
     );
   });
 });

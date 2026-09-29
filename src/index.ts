@@ -55,6 +55,14 @@ export interface GoodMemPluginParams {
   /** A reranker applied to retrieval, as a UUID. */
   rerankerId?: string;
   /**
+   * An LLM GoodMem runs over the retrieved chunks to write a grounded answer,
+   * as a UUID. Off by default. Set here by the developer, never by the model.
+   * The answer is `abstractReply` in `goodmem/search` output and
+   * `goodmem_abstract_reply` on each retrieved document. An LLM does not
+   * rerank: scores are unchanged.
+   */
+  llmId?: string;
+  /**
    * Drop hits scoring below this value. Applies only with `rerankerId` set,
    * because reranker scales are provider-dependent. Off by default.
    */
@@ -116,6 +124,7 @@ export class GoodMemConnection {
   readonly spaceIds: string[];
   readonly uploadDir?: string;
   readonly rerankerId?: string;
+  readonly llmId?: string;
   readonly minScore?: number;
   readonly metadataFilter: Record<string, unknown>;
   readonly maxListItems: number;
@@ -129,6 +138,7 @@ export class GoodMemConnection {
     this.spaceIds = params.spaceIds;
     this.uploadDir = params.uploadDir;
     this.rerankerId = params.rerankerId;
+    this.llmId = params.llmId;
     this.minScore = params.minScore;
     this.metadataFilter = params.metadataFilter ?? {};
     this.maxListItems = params.maxListItems ?? DEFAULT_MAX_LIST_ITEMS;
@@ -155,17 +165,17 @@ export class GoodMemConnection {
       requestedSize: topK,
       fetchMemory: true,
     };
-    // Present means used: an empty rerankerId is refused, not read as unset.
-    // The SDK translates a flat `rerankerId` only in its (message, options)
-    // form; this object form is sent verbatim, and the server rejects a
-    // top-level `rerankerId` with 400 "Unrecognized field". So the
+    // Present means used: an empty rerankerId or llmId is refused, not read
+    // as unset. The SDK translates a flat `rerankerId` only in its (message,
+    // options) form; this object form is sent verbatim, and the server
+    // rejects a top-level `rerankerId` with 400 "Unrecognized field". So the
     // post-processor is built here, as the SDK itself would build it, which
     // also keeps the per-space filters in spaceKeys.
-    if (this.rerankerId != null) {
-      request.postProcessor = {
-        name: CHAT_POST_PROCESSOR,
-        config: { reranker_id: requireUuid(this.rerankerId, 'rerankerId') },
-      };
+    const config: Record<string, string> = {};
+    if (this.rerankerId != null) config.reranker_id = requireUuid(this.rerankerId, 'rerankerId');
+    if (this.llmId != null) config.llm_id = requireUuid(this.llmId, 'llmId');
+    if (Object.keys(config).length > 0) {
+      request.postProcessor = { name: CHAT_POST_PROCESSOR, config };
     }
 
     let outcome: RetrievalOutcome;
@@ -427,6 +437,9 @@ function withoutProvenance(metadata: Record<string, unknown> | undefined): Recor
  * the provenance last: a document retrieved and indexed elsewhere (a copy, a
  * cache, a migration) must not report the original's ids, and a stored
  * `goodmem_partial: false` must not mask a degraded retrieval.
+ *
+ * A Genkit retriever returns documents and nothing else, so the LLM's answer
+ * for the whole retrieval rides on every document, like `goodmem_partial`.
  */
 export function hitToDocument(hit: RetrievalHit, outcome: RetrievalOutcome): Document {
   return Document.fromText(hit.text, {
@@ -439,6 +452,7 @@ export function hitToDocument(hit: RetrievalHit, outcome: RetrievalOutcome): Doc
     goodmem_score_kind: hit.scoreKind,
     goodmem_partial: outcome.partial,
     ...(outcome.partial ? { goodmem_statuses: outcome.statuses } : {}),
+    ...(outcome.abstractReply !== undefined ? { goodmem_abstract_reply: outcome.abstractReply } : {}),
   });
 }
 
@@ -496,6 +510,7 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
   // sends one.
   params.spaceIds.forEach((id, i) => requireUuid(id, `spaceIds[${i}]`));
   if (params.rerankerId != null) requireUuid(params.rerankerId, 'rerankerId');
+  if (params.llmId != null) requireUuid(params.llmId, 'llmId');
 
   return genkitPlugin('goodmem', async (ai: Genkit) => {
     const conn = new GoodMemConnection(params);
@@ -544,6 +559,7 @@ export function goodmem(params: GoodMemPluginParams): GenkitPlugin {
           partial: outcome.partial,
           statuses: outcome.statuses,
           ...(outcome.partial ? { warning: warningText(outcome.statuses) } : {}),
+          ...(outcome.abstractReply !== undefined ? { abstractReply: outcome.abstractReply } : {}),
         };
       }
     );

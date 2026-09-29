@@ -5,7 +5,8 @@
  * which is also the check that no credential is baked into the package.
  *
  *   GOODMEM_API_KEY=... GOODMEM_BASE_URL=https://localhost:8080 \
- *     GOODMEM_TEST_EMBEDDER_ID=... GOODMEM_TEST_RERANKER_ID=... npm run test:live
+ *     GOODMEM_TEST_EMBEDDER_ID=... GOODMEM_TEST_RERANKER_ID=... \
+ *     GOODMEM_TEST_LLM_ID=... npm run test:live
  */
 
 import assert from 'node:assert/strict';
@@ -23,6 +24,7 @@ const KEY = process.env.GOODMEM_API_KEY;
 const EMBEDDER = process.env.GOODMEM_TEST_EMBEDDER_ID;
 const FAILING_EMBEDDER = process.env.GOODMEM_TEST_FAILING_EMBEDDER_ID;
 const RERANKER = process.env.GOODMEM_TEST_RERANKER_ID;
+const LLM = process.env.GOODMEM_TEST_LLM_ID;
 const skip = !(BASE && KEY) ? 'GOODMEM_API_KEY and GOODMEM_BASE_URL are not set' : false;
 
 if (!skip && process.env.GOODMEM_VERIFY_SSL !== 'true') {
@@ -126,6 +128,41 @@ describe('live', { skip }, () => {
       assert.equal(hit.scoreKind, 'vector');
       assert.ok(hit.rawScore < 0 && hit.score > 0, 'a vector score was not flipped');
     }
+  });
+
+  it('a configured LLM writes an answer from the hits', async (t) => {
+    if (!LLM) return t.skip('GOODMEM_TEST_LLM_ID is not set');
+    // 0.2.1 had no llmId: the setting was ignored and no answer came back.
+    const ai = makeAi([spaceId], { llmId: LLM });
+    const out = await tool(ai, 'search', { query: `What is the Genkit live canary?`, topK: 3 });
+    assert.equal(out.partial, false, JSON.stringify(out.statuses));
+    assert.equal(typeof out.abstractReply, 'string', JSON.stringify(out));
+    assert.ok(out.abstractReply.includes(canary), `the answer does not name the canary: ${out.abstractReply}`);
+    assert.ok(out.results.some((r: any) => r.text.includes(canary)));
+    for (const hit of out.results) assert.equal(hit.scoreKind, 'vector', 'an LLM relabelled the scores');
+    const docs = await ai.retrieve({ retriever: 'goodmem/memories', query: canary, options: { k: 3 } });
+    assert.ok(docs.length >= 1);
+    assert.equal(typeof docs[0].metadata?.goodmem_abstract_reply, 'string');
+    assert.ok((docs[0].metadata?.goodmem_abstract_reply as string).length > 0);
+  });
+
+  it('an LLM that does not exist keeps the hits, flagged', async () => {
+    // A well-formed id that names no LLM: the server answers NOT_FOUND +
+    // SUMMARIZATION_FAILED and still returns the hits.
+    const ai = makeAi([spaceId], { llmId: '00000000-0000-4000-8000-000000000000' });
+    const out = await tool(ai, 'search', { query: canary, topK: 3 });
+    assert.equal(out.success, true);
+    assert.equal(out.partial, true);
+    const codes = out.statuses.map((s: any) => s.code);
+    assert.ok(codes.includes('SUMMARIZATION_FAILED'), JSON.stringify(codes));
+    assert.ok(out.results.some((r: any) => r.text.includes(canary)), 'the hits were discarded');
+    assert.ok(!('abstractReply' in out));
+  });
+
+  it('refuses an LLM name in place of its id', async () => {
+    // A model name is the likely mistake; it is refused before any request.
+    const byName = new GoodMemConnection({ baseUrl: BASE!, apiKey: KEY!, spaceIds: [spaceId], llmId: 'qwen3-8b' });
+    await assert.rejects(() => byName.retrieve(canary, 1), /llmId must be a UUID/);
   });
 
   it('the native retriever returns Genkit documents', async () => {

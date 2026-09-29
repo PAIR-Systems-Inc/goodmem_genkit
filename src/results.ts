@@ -94,6 +94,11 @@ export interface RetrievalOutcome {
    */
   reranked: boolean;
   resultSetId: string;
+  /**
+   * The answer the configured LLM wrote from these hits. Absent when no
+   * `llmId` is set, or when the LLM failed -- which the server reports as
+   * `SUMMARIZATION_FAILED` in `statuses`, with the hits kept.
+   */
   abstractReply?: string;
 }
 
@@ -218,7 +223,9 @@ export async function outcomeFromEvents(
       }
       if (event?.abstractReply) {
         const reply = event.abstractReply;
-        outcome.abstractReply = String(reply.reply ?? reply.text ?? reply.content ?? '');
+        // GoodMem sends `{text, relevanceScore, resultSetId}`. Its
+        // relevanceScore is not a hit score and is not used.
+        outcome.abstractReply = String(reply.text ?? reply.reply ?? reply.content ?? '');
         continue;
       }
       const inner = event?.retrievedItem?.chunk?.chunk;
